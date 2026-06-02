@@ -22,6 +22,7 @@
 //******************************************************************************************************
 
 using System;
+using GSF;
 using StreamSplitter;
 
 namespace StreamSplitter.Api.Models
@@ -88,12 +89,17 @@ namespace StreamSplitter.Api.Models
         // Static Methods
 
         /// <summary>
-        /// Creates a new <see cref="ConnectionDto"/> from a <see cref="ProxyConnection"/>.
+        /// Creates a new <see cref="ConnectionDto"/> from a <see cref="ProxyConnection"/> and its
+        /// runtime <see cref="ConnectionState"/>.
         /// </summary>
         /// <param name="connection">Source <see cref="ProxyConnection"/> to map from.</param>
+        /// <param name="runtimeState">
+        /// Live <see cref="ConnectionState"/> read from the associated <see cref="StreamProxy"/>.
+        /// Pass <see cref="ConnectionState.Disabled"/> when no live proxy exists.
+        /// </param>
         /// <returns>A populated <see cref="ConnectionDto"/>.</returns>
         /// <exception cref="ArgumentNullException"><paramref name="connection"/> is <c>null</c>.</exception>
-        public static ConnectionDto FromProxyConnection(ProxyConnection connection)
+        public static ConnectionDto FromProxyConnection(ProxyConnection connection, ConnectionState runtimeState)
         {
             if (connection is null)
                 throw new ArgumentNullException(nameof(connection));
@@ -103,8 +109,8 @@ namespace StreamSplitter.Api.Models
                 Id                         = connection.ID,
                 Name                       = connection.Name,
                 Enabled                    = connection.Enabled,
-                ConnectionState            = connection.ConnectionState,
-                ConnectionStateDescription = connection.ConnectionStateDescription,
+                ConnectionState            = runtimeState,
+                ConnectionStateDescription = runtimeState.GetDescription(),
                 ConnectionString           = connection.ConnectionString,
                 SourceSettings             = connection.SourceSettings,
                 ProxySettings              = connection.ProxySettings

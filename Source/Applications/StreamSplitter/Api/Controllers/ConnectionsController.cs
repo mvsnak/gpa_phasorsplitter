@@ -73,7 +73,7 @@ namespace StreamSplitter.Api.Controllers
             }
 
             ConnectionDto[] dtos = configuration
-                .Select(ConnectionDto.FromProxyConnection)
+                .Select(c => ConnectionDto.FromProxyConnection(c, ServiceHost.Current.GetRuntimeConnectionState(c.ID)))
                 .ToArray();
 
             s_log.Publish(

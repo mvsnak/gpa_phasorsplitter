@@ -138,6 +138,21 @@ namespace StreamSplitter
         internal ProxyConnectionCollection CurrentConfiguration => m_currentConfiguration;
 
         /// <summary>
+        /// Gets the runtime <see cref="ConnectionState"/> for the <see cref="StreamProxy"/> identified by
+        /// <paramref name="connectionId"/>. Returns <see cref="ConnectionState.Disabled"/> when no live
+        /// proxy exists for the given ID (connection is disabled or not yet materialized).
+        /// </summary>
+        /// <param name="connectionId">ID of the <see cref="ProxyConnection"/> to look up.</param>
+        internal ConnectionState GetRuntimeConnectionState(Guid connectionId)
+        {
+            lock (m_streamSplitters)
+            {
+                StreamProxy splitter = m_streamSplitters.Find(s => s.ID == connectionId);
+                return splitter?.StreamProxyStatus.ConnectionState ?? ConnectionState.Disabled;
+            }
+        }
+
+        /// <summary>
         /// Gets the singleton <see cref="ServiceHost"/> instance, available after the service starts.
         /// </summary>
         internal static ServiceHost Current { get; private set; }
