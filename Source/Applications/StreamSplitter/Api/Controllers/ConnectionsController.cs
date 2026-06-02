@@ -24,6 +24,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Web.Http;
 using GSF.Diagnostics;
 using StreamSplitter.Api.Models;
@@ -82,6 +83,53 @@ namespace StreamSplitter.Api.Controllers
                 $"Returning {dtos.Length} connection(s). CorrelationId={correlationId}");
 
             return Ok(dtos);
+        }
+
+        /// <summary>
+        /// Returns the proxy connection identified by <paramref name="id"/>.
+        /// </summary>
+        /// <param name="id">Unique identifier of the connection.</param>
+        /// <returns>
+        /// <see cref="ConnectionDto"/> when found; 404 with a problem detail body when not found.
+        /// </returns>
+        [HttpGet, Route("{id:guid}")]
+        public IHttpActionResult GetConnectionById(Guid id)
+        {
+            string correlationId = GetCorrelationId();
+
+            s_log.Publish(
+                MessageLevel.Info,
+                "GetConnectionById",
+                $"GET /api/connections/{id} requested. CorrelationId={correlationId}");
+
+            ProxyConnectionCollection configuration = ServiceHost.Current?.CurrentConfiguration;
+            ProxyConnection connection = configuration?[id];
+
+            if (connection is null)
+            {
+                s_log.Publish(
+                    MessageLevel.Info,
+                    "GetConnectionById",
+                    $"Connection {id} not found. CorrelationId={correlationId}");
+
+                return Content(HttpStatusCode.NotFound, new
+                {
+                    status = 404,
+                    title  = "Not Found",
+                    detail = $"Connection with ID '{id}' was not found."
+                });
+            }
+
+            ConnectionDto dto = ConnectionDto.FromProxyConnection(
+                connection,
+                ServiceHost.Current.GetRuntimeConnectionState(id));
+
+            s_log.Publish(
+                MessageLevel.Info,
+                "GetConnectionById",
+                $"Returning connection '{connection.Name}'. CorrelationId={correlationId}");
+
+            return Ok(dto);
         }
 
         // Extracts the X-Correlation-Id header value, or generates a new GUID string if absent.
