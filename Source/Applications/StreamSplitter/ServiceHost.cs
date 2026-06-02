@@ -18,6 +18,9 @@
 //  ----------------------------------------------------------------------------------------------------
 //  09/04/2013 - J. Ritchie Carroll
 //       Generated original version of source code.
+//  06/01/2026 - Marcos Vinicius Snak
+//       Added OWIN-based Web API hosting (Story 1): TryStartWebHosting, CurrentConfiguration,
+//       ServiceHost.Current static accessor.
 //
 //******************************************************************************************************
 
@@ -43,7 +46,9 @@ using GSF.IO;
 using GSF.PhasorProtocols;
 using GSF.ServiceProcess;
 using GSF.Units;
+using Microsoft.Owin.Hosting;
 using Microsoft.Win32;
+using StreamSplitter.Api;
 
 namespace StreamSplitter
 {
@@ -62,6 +67,8 @@ namespace StreamSplitter
         private const int DefaultMinThreadPoolIOPortSize = (int)(DefaultMinThreadPoolWorkerSize + DefaultMinThreadPoolWorkerSize * 0.2D);
         private const int DefaultMaxThreadPoolIOPortSize = (int)(DefaultMaxThreadPoolWorkerSize + DefaultMaxThreadPoolWorkerSize * 0.2D);
         private const int DefaultMaxLogFiles = 300;
+        private const bool DefaultWebHostingEnabled = true;
+        private const string DefaultWebHostURL = "http://localhost:8283";
 
         // Fields
         private AutoResetEvent m_configurationLoadComplete;
@@ -69,6 +76,7 @@ namespace StreamSplitter
         private volatile ProxyConnectionCollection m_currentConfiguration;
         private readonly List<StreamProxy> m_streamSplitters;
         private readonly ConcurrentDictionary<object, string> m_derivedNameCache;
+        private IDisposable m_webAppHost;
 
         #endregion
 
@@ -94,6 +102,8 @@ namespace StreamSplitter
 
             // Create a cache for derived proxy connection names
             m_derivedNameCache = new ConcurrentDictionary<object, string>();
+
+            Current = this;
         }
 
         public ServiceHost(IContainer container)
@@ -121,6 +131,17 @@ namespace StreamSplitter
         /// </summary>
         private TcpServer RemotingServer => m_remotingServer;
 
+        /// <summary>
+        /// Gets the current proxy connection configuration.
+        /// Returns <c>null</c> if the configuration has not yet been loaded.
+        /// </summary>
+        internal ProxyConnectionCollection CurrentConfiguration => m_currentConfiguration;
+
+        /// <summary>
+        /// Gets the singleton <see cref="ServiceHost"/> instance, available after the service starts.
+        /// </summary>
+        internal static ServiceHost Current { get; private set; }
+
         #endregion
 
         #region [ Methods ]
@@ -145,6 +166,8 @@ namespace StreamSplitter
             systemSettings.Add("LogPath", defaultLogPath, "Defines the path used to archive log files");
             systemSettings.Add("MaxLogFiles", DefaultMaxLogFiles, "Defines the maximum number of log files to keep");
             systemSettings.Add("DefaultCulture", "en-US", "Default culture to use for language, country/region and calendar formats.");
+            systemSettings.Add("WebHostingEnabled", DefaultWebHostingEnabled, "Flag that determines if the web API hosting is enabled.");
+            systemSettings.Add("WebHostURL", DefaultWebHostURL, "URL endpoint where the Stream Splitter web API is hosted.");
 
             // Create a handler for unobserved task exceptions
             TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
@@ -276,10 +299,15 @@ namespace StreamSplitter
             m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("SendCommand", "Sends command to a specific stream splitter", SendCommandHandler));
 
             LoadCurrentConfiguration();
+            TryStartWebHosting();
         }
 
         private void ServiceHelper_ServiceStopping(object sender, EventArgs e)
         {
+            // Stop web API host before stream splitters so no new requests arrive during shutdown
+            m_webAppHost?.Dispose();
+            m_webAppHost = null;
+
             lock (m_streamSplitters)
             {
                 foreach (StreamProxy splitter in m_streamSplitters)
@@ -317,6 +345,42 @@ namespace StreamSplitter
 
             // Unattach from handler for unobserved task exceptions
             TaskScheduler.UnobservedTaskException -= TaskScheduler_UnobservedTaskException;
+
+            Current = null;
+        }
+
+        // Starts the OWIN-based web API host using settings from the configuration file.
+        private void TryStartWebHosting()
+        {
+            try
+            {
+                CategorizedSettingsElementCollection systemSettings =
+                    ConfigurationFile.Current.Settings["systemSettings"];
+
+                if (!systemSettings["WebHostingEnabled"].ValueAs(DefaultWebHostingEnabled))
+                {
+                    DisplayStatusMessage("Web API hosting is disabled per configuration.", UpdateType.Information);
+                    return;
+                }
+
+                string webHostURL = systemSettings["WebHostURL"].ValueAs(DefaultWebHostURL);
+
+                m_webAppHost = WebApp.Start<Startup>(webHostURL);
+
+                DisplayStatusMessage(
+                    "Web API hosting started at \"{0}\". Swagger UI: {0}/swagger",
+                    UpdateType.Information,
+                    webHostURL);
+            }
+            catch (Exception ex)
+            {
+                DisplayStatusMessage(
+                    "Failed to start web API hosting due to exception: {0}",
+                    UpdateType.Alarm,
+                    ex.Message);
+
+                Logger.SwallowException(ex);
+            }
         }
 
         // Handle task scheduler exceptions
