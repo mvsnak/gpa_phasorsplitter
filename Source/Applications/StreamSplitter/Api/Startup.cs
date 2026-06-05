@@ -18,6 +18,8 @@
 //  ----------------------------------------------------------------------------------------------------
 //  06/01/2026 - Marcos Vinicius Snak
 //       Generated original version of source code.
+//  06/05/2026 - Marcos Vinicius Snak
+//       Added FileUploadOperationFilter to enable file picker on /import endpoint in Swagger UI.
 //
 //******************************************************************************************************
 
@@ -25,6 +27,7 @@ using System.Web.Http;
 using Newtonsoft.Json.Converters;
 using Owin;
 using Swashbuckle.Application;
+using StreamSplitter.Api.Filters;
 
 namespace StreamSplitter.Api
 {
@@ -65,6 +68,7 @@ namespace StreamSplitter.Api
                 {
                     c.SingleApiVersion("v1", "Stream Splitter API");
                     c.DescribeAllEnumsAsStrings();
+                    c.OperationFilter<FileUploadOperationFilter>();
                 })
                 .EnableSwaggerUi();
 

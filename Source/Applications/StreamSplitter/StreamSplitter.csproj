@@ -171,7 +171,9 @@
   <ItemGroup>
     <!-- Web API -->
     <Compile Include="Api\Models\ConnectionDto.cs" />
+    <Compile Include="Api\Models\CreateConnectionRequest.cs" />
     <Compile Include="Api\Controllers\ConnectionsController.cs" />
+    <Compile Include="Api\Filters\FileUploadOperationFilter.cs" />
     <Compile Include="Api\Startup.cs" />
   </ItemGroup>
   <ItemGroup>

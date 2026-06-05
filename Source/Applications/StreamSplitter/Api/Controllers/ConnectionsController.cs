@@ -23,8 +23,11 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
+using System.Threading.Tasks;
 using System.Web.Http;
 using GSF.Diagnostics;
 using StreamSplitter.Api.Models;
@@ -130,6 +133,204 @@ namespace StreamSplitter.Api.Controllers
                 $"Returning connection '{connection.Name}'. CorrelationId={correlationId}");
 
             return Ok(dto);
+        }
+
+        /// <summary>
+        /// Creates one or more proxy connections from a JSON array.
+        /// All items are validated before any connection is created (all-or-nothing semantics).
+        /// </summary>
+        /// <param name="requests">
+        /// Array of connection data. <c>connectionString</c> is required on each item.
+        /// </param>
+        /// <returns>
+        /// 201 Created with the array of created <see cref="ConnectionDto"/> objects,
+        /// or 400 Bad Request if any item fails validation.
+        /// </returns>
+        [HttpPost, Route("")]
+        public IHttpActionResult CreateConnections([FromBody] CreateConnectionRequest[] requests)
+        {
+            string correlationId = GetCorrelationId();
+
+            s_log.Publish(
+                MessageLevel.Info,
+                "CreateConnections",
+                $"POST /api/connections requested ({requests?.Length ?? 0} item(s)). CorrelationId={correlationId}");
+
+            if (requests is null || requests.Length == 0)
+            {
+                return Content(HttpStatusCode.BadRequest, new
+                {
+                    status = 400,
+                    title  = "Bad Request",
+                    detail = "The request body must be a non-empty JSON array of connection objects."
+                });
+            }
+
+            // Validate all items before creating any — all-or-nothing semantics.
+            for (int i = 0; i < requests.Length; i++)
+            {
+                if (string.IsNullOrWhiteSpace(requests[i]?.ConnectionString))
+                {
+                    s_log.Publish(
+                        MessageLevel.Warning,
+                        "CreateConnections",
+                        $"Validation failed at index {i}: connectionString is required. CorrelationId={correlationId}");
+
+                    return Content(HttpStatusCode.BadRequest, new
+                    {
+                        status = 400,
+                        title  = "Bad Request",
+                        detail = $"Item at index {i} is missing a required connectionString."
+                    });
+                }
+            }
+
+            List<ConnectionDto> created = new List<ConnectionDto>();
+
+            foreach (CreateConnectionRequest request in requests)
+            {
+                ProxyConnection connection = new ProxyConnection { ConnectionString = request.ConnectionString };
+
+                try
+                {
+                    ServiceHost.Current.AddConnection(connection);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    return Content(HttpStatusCode.ServiceUnavailable, new
+                    {
+                        status = 503,
+                        title  = "Service Unavailable",
+                        detail = ex.Message
+                    });
+                }
+
+                created.Add(ConnectionDto.FromProxyConnection(
+                    connection,
+                    ServiceHost.Current.GetRuntimeConnectionState(connection.ID)));
+
+                s_log.Publish(
+                    MessageLevel.Info,
+                    "CreateConnections",
+                    $"Connection '{connection.Name}' created. Id={connection.ID}. CorrelationId={correlationId}");
+            }
+
+            return Created("/api/connections", created.ToArray());
+        }
+
+        /// <summary>
+        /// Imports connections from a <c>.s3config</c> file sent as multipart/form-data.
+        /// Each connection in the file is assigned a new server-generated ID to ensure
+        /// CREATE semantics regardless of the IDs in the file.
+        /// </summary>
+        /// <returns>
+        /// 201 Created with the array of imported <see cref="ConnectionDto"/> objects,
+        /// or 400 Bad Request if the file is missing, empty, or not a valid .s3config.
+        /// </returns>
+        [HttpPost, Route("import")]
+        public async Task<IHttpActionResult> ImportFromFile()
+        {
+            string correlationId = GetCorrelationId();
+
+            s_log.Publish(
+                MessageLevel.Info,
+                "ImportFromFile",
+                $"POST /api/connections/import requested. CorrelationId={correlationId}");
+
+            if (!Request.Content.IsMimeMultipartContent())
+            {
+                return Content(HttpStatusCode.BadRequest, new
+                {
+                    status = 400,
+                    title  = "Bad Request",
+                    detail = "Expected multipart/form-data with a .s3config file."
+                });
+            }
+
+            MultipartMemoryStreamProvider provider = new MultipartMemoryStreamProvider();
+            await Request.Content.ReadAsMultipartAsync(provider);
+
+            HttpContent filePart = provider.Contents.FirstOrDefault();
+
+            if (filePart is null)
+            {
+                return Content(HttpStatusCode.BadRequest, new
+                {
+                    status = 400,
+                    title  = "Bad Request",
+                    detail = "No file was included in the request."
+                });
+            }
+
+            // Read the part as a stream to avoid a redundant byte[] copy — the
+            // MultipartMemoryStreamProvider already buffers content in a MemoryStream.
+            using Stream fileStream = await filePart.ReadAsStreamAsync();
+
+            if (fileStream.Length == 0)
+            {
+                return Content(HttpStatusCode.BadRequest, new
+                {
+                    status = 400,
+                    title  = "Bad Request",
+                    detail = "The uploaded file is empty."
+                });
+            }
+
+            ProxyConnectionCollection imported;
+
+            try
+            {
+                imported = ProxyConnectionCollection.DeserializeConfiguration(fileStream);
+            }
+            catch (Exception ex)
+            {
+                s_log.Publish(
+                    MessageLevel.Warning,
+                    "ImportFromFile",
+                    $"Failed to deserialize file. Error={ex.Message}. CorrelationId={correlationId}");
+
+                return Content(HttpStatusCode.BadRequest, new
+                {
+                    status = 400,
+                    title  = "Bad Request",
+                    detail = "The file could not be read as a valid .s3config configuration."
+                });
+            }
+
+            if (imported.Count == 0)
+            {
+                return Content(HttpStatusCode.BadRequest, new
+                {
+                    status = 400,
+                    title  = "Bad Request",
+                    detail = "The .s3config file contains no connections."
+                });
+            }
+
+            List<ConnectionDto> created = new List<ConnectionDto>();
+
+            foreach (ProxyConnection source in imported)
+            {
+                // Assign a new ID to guarantee CREATE semantics — never UPDATE an existing connection.
+                ProxyConnection connection = new ProxyConnection
+                {
+                    ConnectionString     = source.ConnectionString,
+                    ConnectionParameters = source.ConnectionParameters
+                };
+
+                ServiceHost.Current.AddConnection(connection);
+
+                created.Add(ConnectionDto.FromProxyConnection(
+                    connection,
+                    ServiceHost.Current.GetRuntimeConnectionState(connection.ID)));
+            }
+
+            s_log.Publish(
+                MessageLevel.Info,
+                "ImportFromFile",
+                $"Imported {created.Count} connection(s). CorrelationId={correlationId}");
+
+            return Created("/api/connections", created.ToArray());
         }
 
         // Extracts the X-Correlation-Id header value, or generates a new GUID string if absent.

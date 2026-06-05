@@ -18,6 +18,9 @@
 //  ----------------------------------------------------------------------------------------------------
 //  09/03/2013 - J. Ritchie Carroll
 //       Generated original version of source code.
+//  06/05/2026 - Marcos Vinicius Snak
+//       ApplyStreamProxyStatusUpdates: detect connections added externally (e.g. via REST API)
+//       and trigger automatic DownloadConfig so the Manager list stays in sync.
 //
 //******************************************************************************************************
 
@@ -817,7 +820,7 @@ namespace StreamSplitter
 
         private void m_refreshProxyStatusTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
         {
-            if (m_serviceConnection is not null && m_proxyConnections is not null && m_proxyConnections.Count > 0)
+            if (m_serviceConnection is not null && m_proxyConnections is not null)
                 m_serviceConnection.SendCommand("GetStreamProxyStatus");
         }
 
@@ -853,28 +856,43 @@ namespace StreamSplitter
 
         private void ApplyStreamProxyStatusUpdates(object state)
         {
-            if (state is not StreamProxyStatus[] streamProxies || m_proxyConnections is null || m_proxyConnections.Count == 0)
+            if (state is not StreamProxyStatus[] streamProxies || m_proxyConnections is null)
                 return;
 
-            // Apply updates for each stream proxy status
-            foreach (StreamProxyStatus proxyStatus in streamProxies)
+            // When the Manager has no connections but the service does, trigger a download.
+            bool hasUnknownConnections = m_proxyConnections.Count == 0 && streamProxies.Length > 0;
+
+            if (!hasUnknownConnections)
             {
-                // Attempt to find associated proxy connection
-                ProxyConnection proxyConnection;
-                
-                lock (m_proxyConnections)
-                    proxyConnection = m_proxyConnections.FirstOrDefault(connection => connection.ID == proxyStatus.ID);
+                // Apply updates for each stream proxy status
+                foreach (StreamProxyStatus proxyStatus in streamProxies)
+                {
+                    // Attempt to find associated proxy connection
+                    ProxyConnection proxyConnection;
 
-                if (proxyConnection is null)
-                    continue;
+                    lock (m_proxyConnections)
+                        proxyConnection = m_proxyConnections.FirstOrDefault(connection => connection.ID == proxyStatus.ID);
 
-                proxyConnection.ConnectionState = proxyStatus.ConnectionState;
+                    if (proxyConnection is null)
+                    {
+                        // Connection exists in the service but not locally — added externally (e.g. via REST API).
+                        hasUnknownConnections = true;
+                        continue;
+                    }
 
-                if (proxyConnectionEditor.ID != proxyConnection.ID)
-                    continue;
+                    proxyConnection.ConnectionState = proxyStatus.ConnectionState;
 
-                BeginInvoke(ApplyStreamProxyStatusUpdate, proxyStatus);
+                    if (proxyConnectionEditor.ID != proxyConnection.ID)
+                        continue;
+
+                    BeginInvoke(ApplyStreamProxyStatusUpdate, proxyStatus);
+                }
             }
+
+            // When the service reports connections not present in the local list,
+            // download the full configuration to keep the Manager in sync.
+            if (hasUnknownConnections)
+                m_serviceConnection?.SendCommand("DownloadConfig");
 
             BeginInvoke(dataGridView.Refresh);
         }

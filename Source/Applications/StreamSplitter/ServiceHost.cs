@@ -1277,6 +1277,47 @@ namespace StreamSplitter
             m_serviceHelper.UpdateStatus(UpdateType.Alarm, ex.Message + newLines);
         }
 
+        /// <summary>
+        /// Adds or updates a <see cref="ProxyConnection"/> in the running configuration,
+        /// materializes the corresponding <see cref="StreamProxy"/>, and persists the change to disk.
+        /// Mirrors the logic used by the TCP-based <c>UploadConnection</c> command handler.
+        /// </summary>
+        /// <param name="connection"><see cref="ProxyConnection"/> to add or update.</param>
+        /// <exception cref="InvalidOperationException">Configuration has not yet been loaded.</exception>
+        internal void AddConnection(ProxyConnection connection)
+        {
+            if (m_currentConfiguration is null)
+                throw new InvalidOperationException("Configuration is not yet loaded.");
+
+            lock (m_streamSplitters)
+            {
+                StreamProxy existing = m_streamSplitters.Find(s => s.ID == connection.ID);
+
+                if (existing is not null)
+                {
+                    existing.ProxyConnection = connection;
+                    m_currentConfiguration[connection.ID] = connection;
+                }
+                else
+                {
+                    StreamProxy splitter = new StreamProxy(connection);
+
+                    splitter.StatusMessage    += splitter_StatusMessage;
+                    splitter.ProcessException += splitter_ProcessException;
+
+                    m_streamSplitters.Add(splitter);
+                    m_serviceHelper.ServiceComponents.Add(splitter);
+                    m_currentConfiguration.Add(connection);
+                }
+            }
+
+            BackupConfiguration();
+
+            ProxyConnectionCollection.SaveConfiguration(
+                m_currentConfiguration,
+                FilePath.GetAbsolutePath(ConfigurationFileName));
+        }
+
         #endregion
 
         #endregion
