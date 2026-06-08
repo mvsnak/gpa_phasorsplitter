@@ -503,6 +503,47 @@ namespace StreamSplitter.Api.Controllers
         }
 
         /// <summary>
+        /// Returns the current operational status of the proxy connection identified by
+        /// <paramref name="id"/> without retrieving its full configuration.
+        /// </summary>
+        /// <param name="id">Unique identifier of the connection.</param>
+        /// <returns>
+        /// 200 OK with <see cref="ConnectionStatusDto"/>; 404 if not found.
+        /// </returns>
+        /// <response code="200">Current operational status including state, metrics, and recent messages.</response>
+        /// <response code="404">No connection found with the given ID.</response>
+        [HttpGet, Route("{id:guid}/status")]
+        [ResponseType(typeof(ConnectionStatusDto))]
+        public IHttpActionResult GetConnectionStatus(Guid id)
+        {
+            string correlationId = GetCorrelationId();
+
+            s_log.Publish(
+                MessageLevel.Info,
+                "GetConnectionStatus",
+                $"GET /api/connections/{id}/status requested. CorrelationId={correlationId}");
+
+            ConnectionStatusDto status = ServiceHost.Current?.GetConnectionStatus(id);
+
+            if (status is null)
+            {
+                s_log.Publish(
+                    MessageLevel.Info,
+                    "GetConnectionStatus",
+                    $"Connection {id} not found. CorrelationId={correlationId}");
+
+                return Content(HttpStatusCode.NotFound, new
+                {
+                    status = 404,
+                    title  = "Not Found",
+                    detail = $"Connection with ID '{id}' was not found."
+                });
+            }
+
+            return Ok(status);
+        }
+
+        /// <summary>
         /// Removes the proxy connection identified by <paramref name="id"/>, stops its data
         /// flow, and persists the updated configuration.
         /// </summary>

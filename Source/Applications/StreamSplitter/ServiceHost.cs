@@ -139,6 +139,25 @@ namespace StreamSplitter
         internal ProxyConnectionCollection CurrentConfiguration => m_currentConfiguration;
 
         /// <summary>
+        /// Returns an operational status snapshot for the connection identified by <paramref name="id"/>.
+        /// Returns <c>null</c> when the connection does not exist in the current configuration.
+        /// </summary>
+        /// <param name="id">ID of the <see cref="ProxyConnection"/> to look up.</param>
+        internal Api.Models.ConnectionStatusDto GetConnectionStatus(Guid id)
+        {
+            ProxyConnection connection = m_currentConfiguration?[id];
+
+            if (connection is null)
+                return null;
+
+            lock (m_streamSplitters)
+            {
+                StreamProxy splitter = m_streamSplitters.Find(s => s.ID == id);
+                return Api.Models.ConnectionStatusDto.FromServiceHost(id, connection, splitter);
+            }
+        }
+
+        /// <summary>
         /// Gets the runtime <see cref="ConnectionState"/> for the <see cref="StreamProxy"/> identified by
         /// <paramref name="connectionId"/>. Returns <see cref="ConnectionState.Disabled"/> when no live
         /// proxy exists for the given ID (connection is disabled or not yet materialized).
