@@ -864,8 +864,6 @@ namespace StreamSplitter
             if (state is not StreamProxyStatus[] streamProxies || m_proxyConnections is null || m_proxyConnections.Count == 0)
                 return;
 
-            bool hasUnknownConnections = false;
-
             // Apply updates for each stream proxy status
             foreach (StreamProxyStatus proxyStatus in streamProxies)
             {
@@ -876,11 +874,7 @@ namespace StreamSplitter
                     proxyConnection = m_proxyConnections.FirstOrDefault(connection => connection.ID == proxyStatus.ID);
 
                 if (proxyConnection is null)
-                {
-                    // Connection exists in the service but not locally — added externally (e.g. via REST API).
-                    hasUnknownConnections = true;
                     continue;
-                }
 
                 proxyConnection.ConnectionState = proxyStatus.ConnectionState;
 
@@ -889,11 +883,6 @@ namespace StreamSplitter
 
                 BeginInvoke(ApplyStreamProxyStatusUpdate, proxyStatus);
             }
-
-            // When the service reports connections not present in the local list,
-            // download the full configuration to keep the Manager in sync.
-            if (hasUnknownConnections)
-                m_serviceConnection?.SendCommand("DownloadConfig");
 
             BeginInvoke(dataGridView.Refresh);
         }
