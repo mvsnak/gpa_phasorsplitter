@@ -502,6 +502,65 @@ namespace StreamSplitter.Api.Controllers
             return Ok(dto);
         }
 
+        /// <summary>
+        /// Removes the proxy connection identified by <paramref name="id"/>, stops its data
+        /// flow, and persists the updated configuration.
+        /// </summary>
+        /// <param name="id">Unique identifier of the connection to remove.</param>
+        /// <returns>204 No Content on success; 404 if not found.</returns>
+        /// <response code="204">Connection removed and data flow stopped.</response>
+        /// <response code="404">No connection found with the given ID.</response>
+        /// <response code="503">Service configuration not yet loaded.</response>
+        [HttpDelete, Route("{id:guid}")]
+        [ResponseType(typeof(void))]
+        public IHttpActionResult DeleteConnection(Guid id)
+        {
+            string correlationId = GetCorrelationId();
+
+            s_log.Publish(
+                MessageLevel.Info,
+                "DeleteConnection",
+                $"DELETE /api/connections/{id} requested. CorrelationId={correlationId}");
+
+            bool removed;
+
+            try
+            {
+                removed = ServiceHost.Current.RemoveConnection(id);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Content(HttpStatusCode.ServiceUnavailable, new
+                {
+                    status = 503,
+                    title  = "Service Unavailable",
+                    detail = ex.Message
+                });
+            }
+
+            if (!removed)
+            {
+                s_log.Publish(
+                    MessageLevel.Info,
+                    "DeleteConnection",
+                    $"Connection {id} not found. CorrelationId={correlationId}");
+
+                return Content(HttpStatusCode.NotFound, new
+                {
+                    status = 404,
+                    title  = "Not Found",
+                    detail = $"Connection with ID '{id}' was not found."
+                });
+            }
+
+            s_log.Publish(
+                MessageLevel.Info,
+                "DeleteConnection",
+                $"Connection {id} removed. CorrelationId={correlationId}");
+
+            return StatusCode(HttpStatusCode.NoContent);
+        }
+
         // Extracts the X-Correlation-Id header value, or generates a new GUID string if absent.
         private string GetCorrelationId()
         {

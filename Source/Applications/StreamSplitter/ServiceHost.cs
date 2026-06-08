@@ -1322,6 +1322,55 @@ namespace StreamSplitter
             DisplayStatusMessage(ApiConfigChangedBroadcast, UpdateType.Information);
         }
 
+        /// <summary>
+        /// Removes the <see cref="ProxyConnection"/> identified by <paramref name="id"/> from the
+        /// running configuration, stops the associated <see cref="StreamProxy"/>, and persists the change.
+        /// </summary>
+        /// <param name="id">ID of the <see cref="ProxyConnection"/> to remove.</param>
+        /// <returns>
+        /// <c>true</c> if the connection was found and removed; <c>false</c> if it did not exist.
+        /// </returns>
+        /// <exception cref="InvalidOperationException">Configuration is not yet loaded.</exception>
+        internal bool RemoveConnection(Guid id)
+        {
+            if (m_currentConfiguration is null)
+                throw new InvalidOperationException("Configuration is not yet loaded.");
+
+            lock (m_streamSplitters)
+            {
+                ProxyConnection connection = m_currentConfiguration[id];
+
+                if (connection is null)
+                    return false;
+
+                StreamProxy splitter = m_streamSplitters.Find(s => s.ID == id);
+
+                if (splitter is not null)
+                {
+                    splitter.Stop();
+                    splitter.Dispose();
+                    m_streamSplitters.Remove(splitter);
+                    m_serviceHelper.ServiceComponents.Remove(splitter);
+                }
+
+                // RemovingItem fires but has no subscriber in ServiceHost — no UI dialog.
+                // In StreamSplitterManager the event shows a confirmation dialog, but that
+                // code runs in a different process and does not affect the service.
+                m_currentConfiguration.Remove(connection);
+            }
+
+            BackupConfiguration();
+
+            ProxyConnectionCollection.SaveConfiguration(
+                m_currentConfiguration,
+                FilePath.GetAbsolutePath(ConfigurationFileName));
+
+            // Notify connected Manager instances to refresh their configuration view.
+            DisplayStatusMessage(ApiConfigChangedBroadcast, UpdateType.Information);
+
+            return true;
+        }
+
         #endregion
 
         #endregion
