@@ -75,6 +75,7 @@ namespace StreamSplitter
 
         // Constants
         private const int MaximumToolTipSize = 1500;
+        private const string ApiConfigChangedMarker = "[API_CONFIG_CHANGED]";
 
         // Fields
         private string m_configurationFileName;
@@ -816,11 +817,15 @@ namespace StreamSplitter
 
             BeginInvoke((Action)(() => toolStripStatusLabelStatus.Text = e.Argument2.Replace(Environment.NewLine, "  ")));
             UpdateToolTip(e.Argument2);
+
+            // Auto-refresh configuration when the REST API signals a change.
+            if (e.Argument2.ToNonNullString().Contains(ApiConfigChangedMarker))
+                m_serviceConnection?.SendCommand("DownloadConfig");
         }
 
         private void m_refreshProxyStatusTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
         {
-            if (m_serviceConnection is not null && m_proxyConnections is not null)
+            if (m_serviceConnection is not null && m_proxyConnections is not null && m_proxyConnections.Count > 0)
                 m_serviceConnection.SendCommand("GetStreamProxyStatus");
         }
 
@@ -856,37 +861,33 @@ namespace StreamSplitter
 
         private void ApplyStreamProxyStatusUpdates(object state)
         {
-            if (state is not StreamProxyStatus[] streamProxies || m_proxyConnections is null)
+            if (state is not StreamProxyStatus[] streamProxies || m_proxyConnections is null || m_proxyConnections.Count == 0)
                 return;
 
-            // When the Manager has no connections but the service does, trigger a download.
-            bool hasUnknownConnections = m_proxyConnections.Count == 0 && streamProxies.Length > 0;
+            bool hasUnknownConnections = false;
 
-            if (!hasUnknownConnections)
+            // Apply updates for each stream proxy status
+            foreach (StreamProxyStatus proxyStatus in streamProxies)
             {
-                // Apply updates for each stream proxy status
-                foreach (StreamProxyStatus proxyStatus in streamProxies)
+                // Attempt to find associated proxy connection
+                ProxyConnection proxyConnection;
+
+                lock (m_proxyConnections)
+                    proxyConnection = m_proxyConnections.FirstOrDefault(connection => connection.ID == proxyStatus.ID);
+
+                if (proxyConnection is null)
                 {
-                    // Attempt to find associated proxy connection
-                    ProxyConnection proxyConnection;
-
-                    lock (m_proxyConnections)
-                        proxyConnection = m_proxyConnections.FirstOrDefault(connection => connection.ID == proxyStatus.ID);
-
-                    if (proxyConnection is null)
-                    {
-                        // Connection exists in the service but not locally — added externally (e.g. via REST API).
-                        hasUnknownConnections = true;
-                        continue;
-                    }
-
-                    proxyConnection.ConnectionState = proxyStatus.ConnectionState;
-
-                    if (proxyConnectionEditor.ID != proxyConnection.ID)
-                        continue;
-
-                    BeginInvoke(ApplyStreamProxyStatusUpdate, proxyStatus);
+                    // Connection exists in the service but not locally — added externally (e.g. via REST API).
+                    hasUnknownConnections = true;
+                    continue;
                 }
+
+                proxyConnection.ConnectionState = proxyStatus.ConnectionState;
+
+                if (proxyConnectionEditor.ID != proxyConnection.ID)
+                    continue;
+
+                BeginInvoke(ApplyStreamProxyStatusUpdate, proxyStatus);
             }
 
             // When the service reports connections not present in the local list,

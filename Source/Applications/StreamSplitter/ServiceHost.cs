@@ -69,6 +69,7 @@ namespace StreamSplitter
         private const int DefaultMaxLogFiles = 300;
         private const bool DefaultWebHostingEnabled = true;
         private const string DefaultWebHostURL = "http://localhost:8283";
+        private const string ApiConfigChangedBroadcast = "[API_CONFIG_CHANGED]";
 
         // Fields
         private AutoResetEvent m_configurationLoadComplete;
@@ -1316,6 +1317,9 @@ namespace StreamSplitter
             ProxyConnectionCollection.SaveConfiguration(
                 m_currentConfiguration,
                 FilePath.GetAbsolutePath(ConfigurationFileName));
+
+            // Notify connected Manager instances to refresh their configuration view.
+            DisplayStatusMessage(ApiConfigChangedBroadcast, UpdateType.Information);
         }
 
         #endregion

@@ -29,6 +29,7 @@ using System.Net;
 using System.Net.Http;
 using System.Threading.Tasks;
 using System.Web.Http;
+using GSF;
 using GSF.Diagnostics;
 using StreamSplitter.Api.Models;
 
@@ -331,6 +332,126 @@ namespace StreamSplitter.Api.Controllers
                 $"Imported {created.Count} connection(s). CorrelationId={correlationId}");
 
             return Created("/api/connections", created.ToArray());
+        }
+
+        /// <summary>
+        /// Partially updates a proxy connection. Only the fields present in the request body
+        /// are changed; omitted fields retain their current values. The connection is
+        /// automatically restarted after the update.
+        /// </summary>
+        /// <param name="id">Unique identifier of the connection to update.</param>
+        /// <param name="request">Fields to update. All properties are optional.</param>
+        /// <returns>
+        /// 200 OK with the updated <see cref="ConnectionDto"/>, or 404 if not found.
+        /// </returns>
+        [HttpPatch, Route("{id:guid}")]
+        public IHttpActionResult UpdateConnection(Guid id, [FromBody] UpdateConnectionRequest request)
+        {
+            string correlationId = GetCorrelationId();
+
+            s_log.Publish(
+                MessageLevel.Info,
+                "UpdateConnection",
+                $"PATCH /api/connections/{id} requested. CorrelationId={correlationId}");
+
+            if (request is null)
+            {
+                return Content(HttpStatusCode.BadRequest, new
+                {
+                    status = 400,
+                    title  = "Bad Request",
+                    detail = "Request body is required."
+                });
+            }
+
+            ProxyConnectionCollection configuration = ServiceHost.Current?.CurrentConfiguration;
+            ProxyConnection existing = configuration?[id];
+
+            if (existing is null)
+            {
+                s_log.Publish(
+                    MessageLevel.Info,
+                    "UpdateConnection",
+                    $"Connection {id} not found. CorrelationId={correlationId}");
+
+                return Content(HttpStatusCode.NotFound, new
+                {
+                    status = 404,
+                    title  = "Not Found",
+                    detail = $"Connection with ID '{id}' was not found."
+                });
+            }
+
+            // Build the updated connection string from the partial request.
+            string updatedConnectionString;
+
+            if (!string.IsNullOrEmpty(request.ConnectionString))
+            {
+                // Consumer provided a complete connection string — use it directly.
+                updatedConnectionString = request.ConnectionString;
+            }
+            else
+            {
+                // Consumer provided only sub-fields — merge into the existing connection string.
+                Dictionary<string, string> settings = existing.ConnectionString.ParseKeyValuePairs();
+
+                if (request.Name != null)
+                    settings["name"] = request.Name;
+
+                if (request.Enabled.HasValue)
+                    settings["enabled"] = request.Enabled.Value.ToString().ToLower();
+
+                if (request.SourceSettings != null)
+                {
+                    if (string.IsNullOrEmpty(request.SourceSettings))
+                        settings.Remove("sourceSettings");
+                    else
+                        settings["sourceSettings"] = request.SourceSettings;
+                }
+
+                if (request.ProxySettings != null)
+                {
+                    if (string.IsNullOrEmpty(request.ProxySettings))
+                        settings.Remove("proxySettings");
+                    else
+                        settings["proxySettings"] = request.ProxySettings;
+                }
+
+                updatedConnectionString = settings.JoinKeyValuePairs();
+            }
+
+            ProxyConnection updated = new ProxyConnection
+            {
+                ConnectionString     = updatedConnectionString,
+                ConnectionParameters = existing.ConnectionParameters
+            };
+
+            updated.ID = existing.ID;
+
+            try
+            {
+                ServiceHost.Current.AddConnection(updated);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Content(HttpStatusCode.ServiceUnavailable, new
+                {
+                    status = 503,
+                    title  = "Service Unavailable",
+                    detail = ex.Message
+                });
+            }
+
+            ConnectionDto dto = ConnectionDto.FromProxyConnection(
+                updated,
+                ServiceHost.Current.GetRuntimeConnectionState(id));
+
+            s_log.Publish(
+                MessageLevel.Info,
+                "UpdateConnection",
+                $"Connection '{updated.Name}' updated. Id={id}. CorrelationId={correlationId}");
+
+            return Ok(dto);
         }
 
         // Extracts the X-Correlation-Id header value, or generates a new GUID string if absent.
