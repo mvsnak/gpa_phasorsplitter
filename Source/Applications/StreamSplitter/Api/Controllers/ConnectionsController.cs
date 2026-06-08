@@ -29,6 +29,7 @@ using System.Net;
 using System.Net.Http;
 using System.Threading.Tasks;
 using System.Web.Http;
+using System.Web.Http.Description;
 using GSF;
 using GSF.Diagnostics;
 using StreamSplitter.Api.Models;
@@ -55,7 +56,9 @@ namespace StreamSplitter.Api.Controllers
         /// Returns all currently configured proxy connections.
         /// </summary>
         /// <returns>Array of <see cref="ConnectionDto"/> objects representing all configured connections.</returns>
+        /// <response code="200">Array of connections. Empty array when no connections are configured.</response>
         [HttpGet, Route("")]
+        [ResponseType(typeof(ConnectionDto[]))]
         public IHttpActionResult GetConnections()
         {
             string correlationId = GetCorrelationId();
@@ -96,7 +99,10 @@ namespace StreamSplitter.Api.Controllers
         /// <returns>
         /// <see cref="ConnectionDto"/> when found; 404 with a problem detail body when not found.
         /// </returns>
+        /// <response code="200">The requested connection with its current runtime state.</response>
+        /// <response code="404">No connection found with the given ID.</response>
         [HttpGet, Route("{id:guid}")]
+        [ResponseType(typeof(ConnectionDto))]
         public IHttpActionResult GetConnectionById(Guid id)
         {
             string correlationId = GetCorrelationId();
@@ -147,7 +153,22 @@ namespace StreamSplitter.Api.Controllers
         /// 201 Created with the array of created <see cref="ConnectionDto"/> objects,
         /// or 400 Bad Request if any item fails validation.
         /// </returns>
+        /// <remarks>
+        /// The <c>connectionString</c> uses the GSF key=value pair format, with nested
+        /// <c>sourceSettings</c> and <c>proxySettings</c> sub-strings. Example:
+        /// <code>
+        /// [
+        ///   {
+        ///     "connectionString": "name=PDC-001;enabled=true;sourceSettings={server=192.168.1.1;port=4712;phasorProtocol=IEEEC37_118V2;accessID=1};proxySettings={port=4713}"
+        ///   }
+        /// ]
+        /// </code>
+        /// </remarks>
+        /// <response code="201">Array of created connections, each with a server-generated <c>id</c>.</response>
+        /// <response code="400">One or more items are missing a required <c>connectionString</c>.</response>
+        /// <response code="503">Service configuration not yet loaded.</response>
         [HttpPost, Route("")]
+        [ResponseType(typeof(ConnectionDto[]))]
         public IHttpActionResult CreateConnections([FromBody] CreateConnectionRequest[] requests)
         {
             string correlationId = GetCorrelationId();
@@ -228,7 +249,15 @@ namespace StreamSplitter.Api.Controllers
         /// 201 Created with the array of imported <see cref="ConnectionDto"/> objects,
         /// or 400 Bad Request if the file is missing, empty, or not a valid .s3config.
         /// </returns>
+        /// <remarks>
+        /// Upload a <c>.s3config</c> file exported from <c>StreamSplitterManager</c> using
+        /// File → Save Configuration. The file is a SOAP-serialized <c>ProxyConnectionCollection</c>.
+        /// All connections in the file are created with new server-generated IDs.
+        /// </remarks>
+        /// <response code="201">Array of imported connections, each with a new server-generated <c>id</c>.</response>
+        /// <response code="400">File missing, empty, or not a valid .s3config.</response>
         [HttpPost, Route("import")]
+        [ResponseType(typeof(ConnectionDto[]))]
         public async Task<IHttpActionResult> ImportFromFile()
         {
             string correlationId = GetCorrelationId();
@@ -344,7 +373,26 @@ namespace StreamSplitter.Api.Controllers
         /// <returns>
         /// 200 OK with the updated <see cref="ConnectionDto"/>, or 404 if not found.
         /// </returns>
+        /// <remarks>
+        /// Send only the fields that need to change; all others are preserved.
+        /// <para>Disable a connection:</para>
+        /// <code>{ "enabled": false }</code>
+        /// <para>Rename a connection:</para>
+        /// <code>{ "name": "PDC-001-updated" }</code>
+        /// <para>Replace the full connection string (all sub-fields re-parsed):</para>
+        /// <code>{ "connectionString": "name=PDC-001;enabled=true;sourceSettings={...};proxySettings={...}" }</code>
+        /// <para>
+        /// If <c>connectionString</c> is provided, it takes precedence and the individual
+        /// <c>name</c>, <c>enabled</c>, <c>sourceSettings</c>, and <c>proxySettings</c> fields
+        /// are ignored.
+        /// </para>
+        /// </remarks>
+        /// <response code="200">Updated connection with its new runtime state.</response>
+        /// <response code="400">Request body is missing.</response>
+        /// <response code="404">No connection found with the given ID.</response>
+        /// <response code="503">Service configuration not yet loaded.</response>
         [HttpPatch, Route("{id:guid}")]
+        [ResponseType(typeof(ConnectionDto))]
         public IHttpActionResult UpdateConnection(Guid id, [FromBody] UpdateConnectionRequest request)
         {
             string correlationId = GetCorrelationId();
