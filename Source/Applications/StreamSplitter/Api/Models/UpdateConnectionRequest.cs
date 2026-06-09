@@ -18,6 +18,9 @@
 //  ----------------------------------------------------------------------------------------------------
 //  06/05/2026 - Marcos Vinicius Snak
 //       Generated original version of source code.
+//  06/08/2026 - Marcos Vinicius Snak
+//       Removed ConnectionString field; PATCH now uses individual sub-fields only for
+//       true partial-update semantics without conflicting override behaviour.
 //
 //******************************************************************************************************
 
@@ -31,15 +34,6 @@ namespace StreamSplitter.Api.Models
     public class UpdateConnectionRequest
     {
         #region [ Properties ]
-
-        /// <summary>
-        /// Gets or sets the full GSF connection string (key=value pairs).
-        /// When provided and non-empty, it replaces the connection string entirely and all
-        /// sub-fields (<see cref="Name"/>, <see cref="Enabled"/>, <see cref="SourceSettings"/>,
-        /// <see cref="ProxySettings"/>) are re-parsed from it.
-        /// When null or empty, the individual sub-field properties below are applied instead.
-        /// </summary>
-        public string ConnectionString { get; set; }
 
         /// <summary>
         /// Gets or sets the display name of the connection.

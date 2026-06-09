@@ -379,12 +379,11 @@ namespace StreamSplitter.Api.Controllers
         /// <code>{ "enabled": false }</code>
         /// <para>Rename a connection:</para>
         /// <code>{ "name": "PDC-001-updated" }</code>
-        /// <para>Replace the full connection string (all sub-fields re-parsed):</para>
-        /// <code>{ "connectionString": "name=PDC-001;enabled=true;sourceSettings={...};proxySettings={...}" }</code>
+        /// <para>Update the source settings:</para>
+        /// <code>{ "sourceSettings": "server=192.168.1.2;port=4712;phasorProtocol=IEEEC37_118V2;accessID=1" }</code>
         /// <para>
-        /// If <c>connectionString</c> is provided, it takes precedence and the individual
-        /// <c>name</c>, <c>enabled</c>, <c>sourceSettings</c>, and <c>proxySettings</c> fields
-        /// are ignored.
+        /// Each field is independent — you can combine any of them in the same request.
+        /// For <c>sourceSettings</c> and <c>proxySettings</c>, sending an empty string removes the sub-string.
         /// </para>
         /// </remarks>
         /// <response code="200">Updated connection with its new runtime state.</response>
@@ -430,43 +429,33 @@ namespace StreamSplitter.Api.Controllers
                 });
             }
 
-            // Build the updated connection string from the partial request.
-            string updatedConnectionString;
+            // Merge only the provided sub-fields into the existing connection string.
+            // Omitted fields (null) retain their current values.
+            Dictionary<string, string> settings = existing.ConnectionString.ParseKeyValuePairs();
 
-            if (!string.IsNullOrEmpty(request.ConnectionString))
+            if (request.Name != null)
+                settings["name"] = request.Name;
+
+            if (request.Enabled.HasValue)
+                settings["enabled"] = request.Enabled.Value.ToString().ToLower();
+
+            if (request.SourceSettings != null)
             {
-                // Consumer provided a complete connection string — use it directly.
-                updatedConnectionString = request.ConnectionString;
+                if (string.IsNullOrEmpty(request.SourceSettings))
+                    settings.Remove("sourceSettings");
+                else
+                    settings["sourceSettings"] = request.SourceSettings;
             }
-            else
+
+            if (request.ProxySettings != null)
             {
-                // Consumer provided only sub-fields — merge into the existing connection string.
-                Dictionary<string, string> settings = existing.ConnectionString.ParseKeyValuePairs();
-
-                if (request.Name != null)
-                    settings["name"] = request.Name;
-
-                if (request.Enabled.HasValue)
-                    settings["enabled"] = request.Enabled.Value.ToString().ToLower();
-
-                if (request.SourceSettings != null)
-                {
-                    if (string.IsNullOrEmpty(request.SourceSettings))
-                        settings.Remove("sourceSettings");
-                    else
-                        settings["sourceSettings"] = request.SourceSettings;
-                }
-
-                if (request.ProxySettings != null)
-                {
-                    if (string.IsNullOrEmpty(request.ProxySettings))
-                        settings.Remove("proxySettings");
-                    else
-                        settings["proxySettings"] = request.ProxySettings;
-                }
-
-                updatedConnectionString = settings.JoinKeyValuePairs();
+                if (string.IsNullOrEmpty(request.ProxySettings))
+                    settings.Remove("proxySettings");
+                else
+                    settings["proxySettings"] = request.ProxySettings;
             }
+
+            string updatedConnectionString = settings.JoinKeyValuePairs();
 
             ProxyConnection updated = new ProxyConnection
             {
