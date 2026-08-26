@@ -18,6 +18,11 @@
 //  ----------------------------------------------------------------------------------------------------
 //  06/01/2026 - Marcos Vinicius Snak
 //       Generated original version of source code.
+//  08/22/2026 - Eduardo Oliveira
+//       Copilot Review follow-up (Story 7.4.8): GetConnections/GetConnectionById/UpdateConnection now
+//       read connections through ServiceHost's thread-safe snapshot accessors instead of enumerating
+//       CurrentConfiguration directly. ImportFromFile enforces ServiceHost.MaxImportFileSizeBytes and
+//       returns 413 when exceeded. UpdateConnection now uses ToLowerInvariant() for boolean settings.
 //
 //******************************************************************************************************
 
@@ -68,21 +73,19 @@ namespace StreamSplitter.Api.Controllers
                 "GetConnections",
                 $"GET /api/connections requested. CorrelationId={correlationId}");
 
-            ProxyConnectionCollection configuration = ServiceHost.Current?.CurrentConfiguration;
+            // Obtained under ServiceHost's own lock so this cannot race with AddConnection/
+            // RemoveConnection/configuration reload while the collection is being enumerated.
+            ConnectionDto[] dtos = ServiceHost.Current?.GetConnectionsSnapshot() ?? Array.Empty<ConnectionDto>();
 
-            if (configuration is null)
+            if (ServiceHost.Current?.CurrentConfiguration is null)
             {
                 s_log.Publish(
                     MessageLevel.Warning,
                     "GetConnections",
                     $"Configuration not yet loaded. Returning empty list. CorrelationId={correlationId}");
 
-                return Ok(Array.Empty<ConnectionDto>());
+                return Ok(dtos);
             }
-
-            ConnectionDto[] dtos = configuration
-                .Select(c => ConnectionDto.FromProxyConnection(c, ServiceHost.Current.GetRuntimeConnectionState(c.ID)))
-                .ToArray();
 
             s_log.Publish(
                 MessageLevel.Info,
@@ -112,10 +115,11 @@ namespace StreamSplitter.Api.Controllers
                 "GetConnectionById",
                 $"GET /api/connections/{id} requested. CorrelationId={correlationId}");
 
-            ProxyConnectionCollection configuration = ServiceHost.Current?.CurrentConfiguration;
-            ProxyConnection connection = configuration?[id];
+            // Obtained under ServiceHost's own lock so this cannot race with AddConnection/
+            // RemoveConnection/configuration reload while the DTO is being built.
+            ConnectionDto dto = ServiceHost.Current?.GetConnectionSnapshot(id);
 
-            if (connection is null)
+            if (dto is null)
             {
                 s_log.Publish(
                     MessageLevel.Info,
@@ -130,14 +134,10 @@ namespace StreamSplitter.Api.Controllers
                 });
             }
 
-            ConnectionDto dto = ConnectionDto.FromProxyConnection(
-                connection,
-                ServiceHost.Current.GetRuntimeConnectionState(id));
-
             s_log.Publish(
                 MessageLevel.Info,
                 "GetConnectionById",
-                $"Returning connection '{connection.Name}'. CorrelationId={correlationId}");
+                $"Returning connection '{dto.Name}'. CorrelationId={correlationId}");
 
             return Ok(dto);
         }
@@ -256,6 +256,7 @@ namespace StreamSplitter.Api.Controllers
         /// </remarks>
         /// <response code="201">Array of imported connections, each with a new server-generated <c>id</c>.</response>
         /// <response code="400">File missing, empty, or not a valid .s3config.</response>
+        /// <response code="413">Uploaded file exceeds the configured maximum size (<c>MaxImportFileSizeBytes</c>).</response>
         [HttpPost, Route("import")]
         [ResponseType(typeof(ConnectionDto[]))]
         public async Task<IHttpActionResult> ImportFromFile()
@@ -274,6 +275,25 @@ namespace StreamSplitter.Api.Controllers
                     status = 400,
                     title  = "Bad Request",
                     detail = "Expected multipart/form-data with a .s3config file."
+                });
+            }
+
+            // Reject oversized uploads before buffering the multipart body in memory.
+            int maxImportFileSizeBytes = ServiceHost.MaxImportFileSizeBytes;
+            long? contentLength = Request.Content.Headers.ContentLength;
+
+            if (ExceedsMaxImportSize(contentLength, maxImportFileSizeBytes))
+            {
+                s_log.Publish(
+                    MessageLevel.Warning,
+                    "ImportFromFile",
+                    $"Upload rejected: Content-Length {contentLength} exceeds the maximum allowed size of {maxImportFileSizeBytes} bytes. CorrelationId={correlationId}");
+
+                return Content(HttpStatusCode.RequestEntityTooLarge, new
+                {
+                    status = 413,
+                    title  = "Payload Too Large",
+                    detail = $"The uploaded file exceeds the maximum allowed size of {maxImportFileSizeBytes} bytes."
                 });
             }
 
@@ -411,8 +431,9 @@ namespace StreamSplitter.Api.Controllers
                 });
             }
 
-            ProxyConnectionCollection configuration = ServiceHost.Current?.CurrentConfiguration;
-            ProxyConnection existing = configuration?[id];
+            // Obtained under ServiceHost's own lock to avoid reading a connection that is
+            // concurrently being added/removed/updated.
+            ProxyConnection existing = ServiceHost.Current?.GetConfiguredConnection(id);
 
             if (existing is null)
             {
@@ -437,7 +458,7 @@ namespace StreamSplitter.Api.Controllers
                 settings["name"] = request.Name;
 
             if (request.Enabled.HasValue)
-                settings["enabled"] = request.Enabled.Value.ToString().ToLower();
+                settings["enabled"] = request.Enabled.Value.ToString().ToLowerInvariant();
 
             if (request.SourceSettings != null)
             {
@@ -598,6 +619,14 @@ namespace StreamSplitter.Api.Controllers
                 return values.FirstOrDefault() ?? Guid.NewGuid().ToString();
 
             return Guid.NewGuid().ToString();
+        }
+
+        // Determines whether the given Content-Length exceeds the configured maximum import file
+        // size. A null Content-Length is not rejected here; ImportFromFile still guards against an
+        // empty stream once the body has been read.
+        internal static bool ExceedsMaxImportSize(long? contentLength, int maxSizeBytes)
+        {
+            return contentLength.HasValue && contentLength.Value > maxSizeBytes;
         }
 
         #endregion

@@ -21,22 +21,16 @@
 //  06/01/2026 - Marcos Vinicius Snak
 //       Added OWIN-based Web API hosting (Story 1): TryStartWebHosting, CurrentConfiguration,
 //       ServiceHost.Current static accessor.
+//  08/22/2026 - Eduardo Oliveira
+//       Copilot Review follow-up (Story 7.4.8): added thread-safe connection snapshot accessors
+//       (GetConnectionsSnapshot, GetConnectionSnapshot, GetConfiguredConnection) so the REST API no
+//       longer enumerates CurrentConfiguration without the lock used by AddConnection/RemoveConnection.
+//       Wired AuthenticationSchemes/AnonymousResourceExpression into TryStartWebHosting with a
+//       fail-secure check (IsAuthenticationSchemeSupported) instead of leaving them unread. Added the
+//       configurable MaxImportFileSizeBytes setting used by the import endpoint.
 //
 //******************************************************************************************************
 
-using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Diagnostics;
-using System.Globalization;
-using System.IO;
-using System.Linq;
-using System.Runtime;
-using System.ServiceProcess;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
 using GSF;
 using GSF.Communication;
 using GSF.Configuration;
@@ -49,6 +43,20 @@ using GSF.Units;
 using Microsoft.Owin.Hosting;
 using Microsoft.Win32;
 using StreamSplitter.Api;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Runtime;
+using System.ServiceProcess;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace StreamSplitter
 {
@@ -59,27 +67,35 @@ namespace StreamSplitter
     {
         #region [ Members ]
 
+        private const string ApiConfigChangedBroadcast = "[API_CONFIG_CHANGED]";
+
+        private const int ConfigurationBackups = 5;
+
         // Constants
         private const string ConfigurationFileName = "ProxyConnections.xml";
-        private const int ConfigurationBackups = 5;
-        private const int DefaultMinThreadPoolWorkerSize = 25;
+
+        private const string DefaultAnonymousResourceExpression = "^/api/";
+        private const string DefaultAuthenticationScheme = "Anonymous";
+        private const int DefaultMaxImportFileSizeBytes = 10 * 1024 * 1024;
+        private const int DefaultMaxLogFiles = 300;
+        private const int DefaultMaxThreadPoolIOPortSize = (int)(DefaultMaxThreadPoolWorkerSize + DefaultMaxThreadPoolWorkerSize * 0.2D);
         private const int DefaultMaxThreadPoolWorkerSize = 100;
         private const int DefaultMinThreadPoolIOPortSize = (int)(DefaultMinThreadPoolWorkerSize + DefaultMinThreadPoolWorkerSize * 0.2D);
-        private const int DefaultMaxThreadPoolIOPortSize = (int)(DefaultMaxThreadPoolWorkerSize + DefaultMaxThreadPoolWorkerSize * 0.2D);
-        private const int DefaultMaxLogFiles = 300;
+        private const int DefaultMinThreadPoolWorkerSize = 25;
         private const bool DefaultWebHostingEnabled = true;
         private const string DefaultWebHostURL = "http://localhost:8283";
-        private const string ApiConfigChangedBroadcast = "[API_CONFIG_CHANGED]";
+        private readonly ConcurrentDictionary<object, string> m_derivedNameCache;
+
+        private readonly List<StreamProxy> m_streamSplitters;
 
         // Fields
         private AutoResetEvent m_configurationLoadComplete;
-        private object m_queuedConfigurationLoadPending;
+
         private volatile ProxyConnectionCollection m_currentConfiguration;
-        private readonly List<StreamProxy> m_streamSplitters;
-        private readonly ConcurrentDictionary<object, string> m_derivedNameCache;
+        private object m_queuedConfigurationLoadPending;
         private IDisposable m_webAppHost;
 
-        #endregion
+        #endregion [ Members ]
 
         #region [ Constructors ]
 
@@ -113,9 +129,27 @@ namespace StreamSplitter
             container?.Add(this);
         }
 
-        #endregion
+        #endregion [ Constructors ]
 
         #region [ Properties ]
+
+        /// <summary>
+        /// Gets the singleton <see cref="ServiceHost"/> instance, available after the service starts.
+        /// </summary>
+        internal static ServiceHost Current { get; private set; }
+
+        /// <summary>
+        /// Gets the maximum allowed size, in bytes, of a configuration file accepted by the
+        /// connections import endpoint, as configured in <c>systemSettings</c>.
+        /// </summary>
+        internal static int MaxImportFileSizeBytes =>
+            ConfigurationFile.Current.Settings["systemSettings"]["MaxImportFileSizeBytes"].ValueAs(DefaultMaxImportFileSizeBytes);
+
+        /// <summary>
+        /// Gets the current proxy connection configuration. Returns <c>null</c> if the
+        /// configuration has not yet been loaded.
+        /// </summary>
+        internal ProxyConnectionCollection CurrentConfiguration => m_currentConfiguration;
 
         /// <summary>
         /// Gets the related remote console application name.
@@ -123,24 +157,122 @@ namespace StreamSplitter
         private string ConsoleApplicationName => ServiceName + "Console.exe";
 
         /// <summary>
-        /// Gets access to the <see cref="GSF.ServiceProcess.ServiceHelper"/>.
-        /// </summary>
-        private ServiceHelper ServiceHelper => m_serviceHelper;
-
-        /// <summary>
         /// Gets reference to the <see cref="TcpServer"/> based remoting server.
         /// </summary>
         private TcpServer RemotingServer => m_remotingServer;
 
         /// <summary>
-        /// Gets the current proxy connection configuration.
-        /// Returns <c>null</c> if the configuration has not yet been loaded.
+        /// Gets access to the <see cref="GSF.ServiceProcess.ServiceHelper"/>.
         /// </summary>
-        internal ProxyConnectionCollection CurrentConfiguration => m_currentConfiguration;
+        private ServiceHelper ServiceHelper => m_serviceHelper;
 
         /// <summary>
-        /// Returns an operational status snapshot for the connection identified by <paramref name="id"/>.
-        /// Returns <c>null</c> when the connection does not exist in the current configuration.
+        /// Determines whether <paramref name="scheme"/> is an authentication scheme supported by
+        /// the web API host. Only <c>"Anonymous"</c> is currently implemented; any other value is
+        /// rejected so <see cref="TryStartWebHosting"/> fails secure instead of silently falling
+        /// back to anonymous access.
+        /// </summary>
+        /// <param name="scheme">Configured value of the <c>AuthenticationSchemes</c> setting.</param>
+        internal static bool IsAuthenticationSchemeSupported(string scheme)
+        {
+            return string.Equals(scheme?.Trim(), DefaultAuthenticationScheme, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Adds or updates a <see cref="ProxyConnection"/> in the running configuration,
+        /// materializes the corresponding <see cref="StreamProxy"/>, and persists the change to
+        /// disk. Mirrors the logic used by the TCP-based <c>UploadConnection</c> command handler.
+        /// </summary>
+        /// <param name="connection"><see cref="ProxyConnection"/> to add or update.</param>
+        /// <exception cref="InvalidOperationException">Configuration has not yet been loaded.</exception>
+        internal void AddConnection(ProxyConnection connection)
+        {
+            if (m_currentConfiguration is null)
+                throw new InvalidOperationException("Configuration is not yet loaded.");
+
+            lock (m_streamSplitters)
+            {
+                StreamProxy existing = m_streamSplitters.Find(s => s.ID == connection.ID);
+
+                if (existing is not null)
+                {
+                    existing.ProxyConnection = connection;
+                    m_currentConfiguration[connection.ID] = connection;
+                }
+                else
+                {
+                    StreamProxy splitter = new StreamProxy(connection);
+
+                    splitter.StatusMessage += splitter_StatusMessage;
+                    splitter.ProcessException += splitter_ProcessException;
+
+                    m_streamSplitters.Add(splitter);
+                    m_serviceHelper.ServiceComponents.Add(splitter);
+                    m_currentConfiguration.Add(connection);
+                }
+            }
+
+            BackupConfiguration();
+
+            ProxyConnectionCollection.SaveConfiguration(
+                m_currentConfiguration,
+                FilePath.GetAbsolutePath(ConfigurationFileName));
+
+            // Notify connected Manager instances to refresh their configuration view.
+            DisplayStatusMessage(ApiConfigChangedBroadcast, UpdateType.Information);
+        }
+
+        /// <summary>
+        /// Returns the <see cref="ProxyConnection"/> identified by <paramref name="id"/>, obtained
+        /// under the same lock used to guard configuration mutations. Returns <c>null</c> when the
+        /// connection does not exist in the current configuration.
+        /// </summary>
+        /// <param name="id">ID of the <see cref="ProxyConnection"/> to look up.</param>
+        internal ProxyConnection GetConfiguredConnection(Guid id)
+        {
+            lock (m_streamSplitters)
+            {
+                return m_currentConfiguration?[id];
+            }
+        }
+
+        /// <summary>
+        /// Returns a thread-safe snapshot of the connection identified by <paramref name="id"/> as
+        /// an <see cref="Api.Models.ConnectionDto"/>, obtained under the same lock used to guard
+        /// configuration mutations. Returns <c>null</c> when the connection does not exist in the
+        /// current configuration.
+        /// </summary>
+        /// <param name="id">ID of the <see cref="ProxyConnection"/> to look up.</param>
+        internal Api.Models.ConnectionDto GetConnectionSnapshot(Guid id)
+        {
+            lock (m_streamSplitters)
+            {
+                ProxyConnection connection = m_currentConfiguration?[id];
+                return connection is null ? null : Api.Models.ConnectionDto.FromProxyConnection(connection, GetRuntimeConnectionState(id));
+            }
+        }
+
+        /// <summary>
+        /// Returns a thread-safe snapshot of all currently configured connections as <see
+        /// cref="Api.Models.ConnectionDto"/> instances, obtained under the same lock used to guard
+        /// configuration mutations. Returns an empty array when the configuration has not yet been loaded.
+        /// </summary>
+        internal Api.Models.ConnectionDto[] GetConnectionsSnapshot()
+        {
+            lock (m_streamSplitters)
+            {
+                if (m_currentConfiguration is null)
+                    return Array.Empty<Api.Models.ConnectionDto>();
+
+                return m_currentConfiguration
+                    .Select(connection => Api.Models.ConnectionDto.FromProxyConnection(connection, GetRuntimeConnectionState(connection.ID)))
+                    .ToArray();
+            }
+        }
+
+        /// <summary>
+        /// Returns an operational status snapshot for the connection identified by <paramref
+        /// name="id"/>. Returns <c>null</c> when the connection does not exist in the current configuration.
         /// </summary>
         /// <param name="id">ID of the <see cref="ProxyConnection"/> to look up.</param>
         internal Api.Models.ConnectionStatusDto GetConnectionStatus(Guid id)
@@ -158,9 +290,10 @@ namespace StreamSplitter
         }
 
         /// <summary>
-        /// Gets the runtime <see cref="ConnectionState"/> for the <see cref="StreamProxy"/> identified by
-        /// <paramref name="connectionId"/>. Returns <see cref="ConnectionState.Disabled"/> when no live
-        /// proxy exists for the given ID (connection is disabled or not yet materialized).
+        /// Gets the runtime <see cref="ConnectionState"/> for the <see cref="StreamProxy"/>
+        /// identified by <paramref name="connectionId"/>. Returns <see
+        /// cref="ConnectionState.Disabled"/> when no live proxy exists for the given ID (connection
+        /// is disabled or not yet materialized).
         /// </summary>
         /// <param name="connectionId">ID of the <see cref="ProxyConnection"/> to look up.</param>
         internal ConnectionState GetRuntimeConnectionState(Guid connectionId)
@@ -172,435 +305,59 @@ namespace StreamSplitter
             }
         }
 
-        /// <summary>
-        /// Gets the singleton <see cref="ServiceHost"/> instance, available after the service starts.
-        /// </summary>
-        internal static ServiceHost Current { get; private set; }
-
-        #endregion
+        #endregion [ Properties ]
 
         #region [ Methods ]
 
         #region [ Service Event Handlers ]
 
-        private void ServiceHelper_ServiceStarting(object sender, EventArgs<string[]> e)
+        /// <summary>
+        /// Removes the <see cref="ProxyConnection"/> identified by <paramref name="id"/> from the
+        /// running configuration, stops the associated <see cref="StreamProxy"/>, and persists the change.
+        /// </summary>
+        /// <param name="id">ID of the <see cref="ProxyConnection"/> to remove.</param>
+        /// <returns>
+        /// <c>true</c> if the connection was found and removed; <c>false</c> if it did not exist.
+        /// </returns>
+        /// <exception cref="InvalidOperationException">Configuration is not yet loaded.</exception>
+        internal bool RemoveConnection(Guid id)
         {
-            // Make sure default service settings exist
-            ConfigurationFile configFile = ConfigurationFile.Current;
-
-            string servicePath = FilePath.GetAbsolutePath("");
-            string defaultLogPath = string.Format("{0}{1}Logs{1}", servicePath, Path.DirectorySeparatorChar);
-
-            // System settings
-            CategorizedSettingsElementCollection systemSettings = configFile.Settings["systemSettings"];
-            systemSettings.Add("SocketErrorReportingInterval", "10", "Interval, in seconds, that defines the maximum reporting rate for duplicate exceptions on a connection.");
-            systemSettings.Add("MinThreadPoolWorkerThreads", DefaultMinThreadPoolWorkerSize, "Defines the minimum number of allowed thread pool worker threads.");
-            systemSettings.Add("MaxThreadPoolWorkerThreads", DefaultMaxThreadPoolWorkerSize, "Defines the maximum number of allowed thread pool worker threads.");
-            systemSettings.Add("MinThreadPoolIOPortThreads", DefaultMinThreadPoolIOPortSize, "Defines the minimum number of allowed thread pool I/O completion port threads (used by socket layer).");
-            systemSettings.Add("MaxThreadPoolIOPortThreads", DefaultMaxThreadPoolIOPortSize, "Defines the maximum number of allowed thread pool I/O completion port threads (used by socket layer).");
-            systemSettings.Add("LogPath", defaultLogPath, "Defines the path used to archive log files");
-            systemSettings.Add("MaxLogFiles", DefaultMaxLogFiles, "Defines the maximum number of log files to keep");
-            systemSettings.Add("DefaultCulture", "en-US", "Default culture to use for language, country/region and calendar formats.");
-            systemSettings.Add("WebHostingEnabled", DefaultWebHostingEnabled, "Flag that determines if the web API hosting is enabled.");
-            systemSettings.Add("WebHostURL", DefaultWebHostURL, "URL endpoint where the Stream Splitter web API is hosted.");
-
-            // Create a handler for unobserved task exceptions
-            TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
-
-            // Attempt to set default culture
-            try
-            {
-                string defaultCulture = systemSettings["DefaultCulture"].ValueAs("en-US");
-                CultureInfo.DefaultThreadCurrentCulture = CultureInfo.CreateSpecificCulture(defaultCulture);     // Defaults for date formatting, etc.
-                CultureInfo.DefaultThreadCurrentUICulture = CultureInfo.CreateSpecificCulture(defaultCulture);   // Culture for resource strings, etc.
-            }
-            catch (Exception ex)
-            {
-                DisplayStatusMessage("Failed to set default culture due to exception, defaulting to \"{1}\": {0}", UpdateType.Alarm, ex.Message, CultureInfo.CurrentCulture.Name.ToNonNullNorEmptyString("Undetermined"));
-                Logger.SwallowException(ex);
-            }
-
-            // Retrieve application log path as defined in the config file
-            string logPath = FilePath.GetAbsolutePath(systemSettings["LogPath"].Value);
-
-            // Make sure log directory exists
-            try
-            {
-                if (!Directory.Exists(logPath))
-                    Directory.CreateDirectory(logPath);
-            }
-            catch (Exception ex)
-            {
-                // Attempt to default back to common log file path
-                if (!Directory.Exists(defaultLogPath))
-                {
-                    try
-                    {
-                        Directory.CreateDirectory(defaultLogPath);
-                    }
-                    catch
-                    {
-                        defaultLogPath = servicePath;
-                    }
-                }
-
-                DisplayStatusMessage("Failed to create logging directory \"{0}\" due to exception, defaulting to \"{1}\": {2}", UpdateType.Alarm, logPath, defaultLogPath, ex.Message);
-                Logger.SwallowException(ex);
-                logPath = defaultLogPath;
-            }
-
-            int maxLogFiles = systemSettings["MaxLogFiles"].ValueAs(DefaultMaxLogFiles);
-
-            try
-            {
-                Logger.FileWriter.SetPath(logPath);
-                Logger.FileWriter.SetLoggingFileCount(maxLogFiles);
-            }
-            catch (Exception ex)
-            {
-                DisplayStatusMessage("Failed to set logging path \"{0}\" or max file count \"{1}\" due to exception: {2}", UpdateType.Alarm, logPath, maxLogFiles, ex.Message);
-                Logger.SwallowException(ex);
-            }
-
-            // Setup default thread pool size
-            try
-            {
-                ThreadPool.SetMinThreads(systemSettings["MinThreadPoolWorkerThreads"].ValueAs(DefaultMinThreadPoolWorkerSize), systemSettings["MinThreadPoolIOPortThreads"].ValueAs(DefaultMinThreadPoolIOPortSize));
-                ThreadPool.SetMaxThreads(systemSettings["MaxThreadPoolWorkerThreads"].ValueAs(DefaultMaxThreadPoolWorkerSize), systemSettings["MaxThreadPoolIOPortThreads"].ValueAs(DefaultMaxThreadPoolIOPortSize));
-            }
-            catch (Exception ex)
-            {
-                DisplayStatusMessage("Failed to set desired thread pool size due to exception: {0}", UpdateType.Alarm, ex.Message);
-                Logger.SwallowException(ex);
-            }
-
-            // Initialize system settings
-            m_configurationLoadComplete = new AutoResetEvent(true);
-            m_queuedConfigurationLoadPending = new object();
+            if (m_currentConfiguration is null)
+                throw new InvalidOperationException("Configuration is not yet loaded.");
 
             lock (m_streamSplitters)
             {
-                m_streamSplitters.Clear();
-            }
-        }
+                ProxyConnection connection = m_currentConfiguration[id];
 
-        private void ServiceHelper_ServiceStarted(object sender, EventArgs e)
-        {
-            // Define a line of asterisks for emphasis
-            string stars = new('*', 79);
+                if (connection is null)
+                    return false;
 
-            // Log startup information
-            m_serviceHelper.UpdateStatus(
-                UpdateType.Information,
-                "\r\n\r\n{0}\r\n\r\n" +
-                "     System Time: {1} UTC\r\n\r\n" +
-                "    Current Path: {2}\r\n\r\n" +
-                "    Machine Name: {3}\r\n\r\n" +
-                "      OS Version: {4}\r\n\r\n" +
-                "    Product Name: {5}\r\n\r\n" +
-                "  Working Memory: {6}\r\n\r\n" +
-                "  Execution Mode: {7}-bit\r\n\r\n" +
-                "      Processors: {8}\r\n\r\n" +
-                "  GC Server Mode: {9}\r\n\r\n" +
-                " GC Latency Mode: {10}\r\n\r\n" +
-                " Process Account: {11}\\{12}\r\n\r\n" +
-                "{13}\r\n",
-                stars,
-                DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
-                FilePath.TrimFileName(FilePath.RemovePathSuffix(FilePath.GetAbsolutePath("")), 61),
-                Environment.MachineName,
-                Environment.OSVersion.VersionString,
-                Registry.GetValue("HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ProductName", null).ToNonNullString("<Unavailable>"),
-                SI2.ToScaledString(Environment.WorkingSet, 3, "B", SI2.IECSymbols),
-                IntPtr.Size * 8,
-                Environment.ProcessorCount,
-                GCSettings.IsServerGC,
-                GCSettings.LatencyMode,
-                Environment.UserDomainName,
-                Environment.UserName,
-                stars);
+                StreamProxy splitter = m_streamSplitters.Find(s => s.ID == id);
 
-            // Set up heartbeat as a scheduled service
-            m_serviceHelper.AddScheduledProcess(ServiceHeartbeatHandler, "ServiceHeartbeat", "* * * * *");
-
-            // Setup custom service commands
-            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("Restart", "Attempts to restart the host service", RestartServiceHandler));
-            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("GetStreamProxyStatus", "Gets current status for all stream proxies", GetStreamProxyStatus));
-            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("ReloadConfig", "Reloads the current configuration", ReloadConfigurationHandler));
-            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("DownloadConfig", "Provides the current configuration to requester", DownloadConfigurationHandler));
-            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("UploadConfig", "Deserializes and loads received configuration", UploadConfigurationHandler));
-            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("UploadConnection", "Applies received proxy connection to running configuration", UploadConnectionHandler));
-            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("EnumerateSplitters", "Enumerates all stream splitters", EnumerateSplittersHandler, new[] { "list", "dir", "ls" }));
-            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("SendCommand", "Sends command to a specific stream splitter", SendCommandHandler));
-
-            LoadCurrentConfiguration();
-            TryStartWebHosting();
-        }
-
-        private void ServiceHelper_ServiceStopping(object sender, EventArgs e)
-        {
-            // Stop web API host before stream splitters so no new requests arrive during shutdown
-            m_webAppHost?.Dispose();
-            m_webAppHost = null;
-
-            lock (m_streamSplitters)
-            {
-                foreach (StreamProxy splitter in m_streamSplitters)
+                if (splitter is not null)
                 {
                     splitter.Stop();
                     splitter.Dispose();
+                    m_streamSplitters.Remove(splitter);
                     m_serviceHelper.ServiceComponents.Remove(splitter);
                 }
+
+                // RemovingItem fires but has no subscriber in ServiceHost — no UI dialog. In
+                // StreamSplitterManager the event shows a confirmation dialog, but that code runs
+                // in a different process and does not affect the service.
+                m_currentConfiguration.Remove(connection);
             }
 
-            m_serviceHelper.ServiceStarting -= ServiceHelper_ServiceStarting;
-            m_serviceHelper.ServiceStarted -= ServiceHelper_ServiceStarted;
-            m_serviceHelper.ServiceStopping -= ServiceHelper_ServiceStopping;
+            BackupConfiguration();
 
-            if (m_serviceHelper.StatusLog is not null)
-            {
-                m_serviceHelper.StatusLog.Flush();
-                m_serviceHelper.StatusLog.LogException -= LogExceptionHandler;
-            }
+            ProxyConnectionCollection.SaveConfiguration(
+                m_currentConfiguration,
+                FilePath.GetAbsolutePath(ConfigurationFileName));
 
-            if (m_serviceHelper.ErrorLogger is not null && m_serviceHelper.ErrorLogger.ErrorLog is not null)
-            {
-                m_serviceHelper.ErrorLogger.ErrorLog.Flush();
-                m_serviceHelper.ErrorLogger.ErrorLog.LogException -= LogExceptionHandler;
-            }
+            // Notify connected Manager instances to refresh their configuration view.
+            DisplayStatusMessage(ApiConfigChangedBroadcast, UpdateType.Information);
 
-            if (m_configurationLoadComplete is not null)
-            {
-                // Release any waiting threads before disposing wait handle
-                m_configurationLoadComplete.Set();
-                m_configurationLoadComplete.Dispose();
-            }
-
-            m_configurationLoadComplete = null;
-
-            // Unattach from handler for unobserved task exceptions
-            TaskScheduler.UnobservedTaskException -= TaskScheduler_UnobservedTaskException;
-
-            Current = null;
-        }
-
-        // Starts the OWIN-based web API host using settings from the configuration file.
-        private void TryStartWebHosting()
-        {
-            try
-            {
-                CategorizedSettingsElementCollection systemSettings =
-                    ConfigurationFile.Current.Settings["systemSettings"];
-
-                if (!systemSettings["WebHostingEnabled"].ValueAs(DefaultWebHostingEnabled))
-                {
-                    DisplayStatusMessage("Web API hosting is disabled per configuration.", UpdateType.Information);
-                    return;
-                }
-
-                string webHostURL = systemSettings["WebHostURL"].ValueAs(DefaultWebHostURL);
-
-                m_webAppHost = WebApp.Start<Startup>(webHostURL);
-
-                DisplayStatusMessage(
-                    "Web API hosting started at \"{0}\". Swagger UI: {0}/swagger",
-                    UpdateType.Information,
-                    webHostURL);
-            }
-            catch (Exception ex)
-            {
-                DisplayStatusMessage(
-                    "Failed to start web API hosting due to exception: {0}",
-                    UpdateType.Alarm,
-                    ex.Message);
-
-                Logger.SwallowException(ex);
-            }
-        }
-
-        // Handle task scheduler exceptions
-        private void TaskScheduler_UnobservedTaskException(object sender, UnobservedTaskExceptionEventArgs e)
-        {
-            foreach (Exception ex in e.Exception.Flatten().InnerExceptions)
-            {
-                m_serviceHelper.ErrorLogger.Log(ex, false);
-            }
-
-            e.SetObserved();
-        }
-
-        // Event handler for processing exceptions encountered while writing entries to a log file.
-        private void LogExceptionHandler(object sender, EventArgs<Exception> e)
-        {
-            DisplayStatusMessage("Log file exception: " + e.Argument.Message, UpdateType.Alarm);
-        }
-
-        // Handle auto-health display.
-        private void ServiceHeartbeatHandler(string s, object[] args)
-        {
-            const string requestCommand = "Health";
-            ClientRequestHandler requestHandler = m_serviceHelper.FindClientRequestHandler(requestCommand);
-
-            // Send a "Health" command to ourselves on heart-beat schedule...
-            requestHandler?.HandlerMethod(ClientHelper.PretendRequest(requestCommand));
-        }
-
-        #endregion
-
-        #region [ Configuration Management ]
-
-        /// <summary>
-        /// Loads the current system configuration.
-        /// </summary>
-        /// <remarks>
-        /// This method handles loading of the current system configuration one request at once.
-        /// </remarks>
-        private void LoadCurrentConfiguration()
-        {
-            try
-            {
-                // Queue configuration deserialization
-                ThreadPool.QueueUserWorkItem(QueueConfigurationLoad);
-            }
-            catch (Exception ex)
-            {
-                string message = $"Failed to queue configuration load due to exception: {ex.Message}";
-                HandleException(new InvalidOperationException(message, ex));
-            }
-        }
-
-        // Since configuration deserialization might take a while, we queue-up activity for one-at-a-time processing
-        private void QueueConfigurationLoad(object state)
-        {
-            // Queue up a configuration cache unless another thread has already requested one
-            if (!Monitor.TryEnter(m_queuedConfigurationLoadPending, 500))
-                return;
-
-            try
-            {
-                // Queue new configuration load after waiting for any prior cache operation to complete
-                if (m_configurationLoadComplete.WaitOne())
-                {
-                    try
-                    {
-                        // Queue up task to execute load of the latest configuration
-                        ThreadPool.QueueUserWorkItem(ExecuteConfigurationLoad);
-                    }
-                    catch (Exception ex)
-                    {
-                        string message = $"Failed to queue configuration load process due to exception: {ex.Message}";
-                        HandleException(new InvalidOperationException(message, ex));
-                    }
-                }
-            }
-            finally
-            {
-                Monitor.Exit(m_queuedConfigurationLoadPending);
-            }
-        }
-
-        // Executes actual deserialization of current configuration
-        private void ExecuteConfigurationLoad(object state)
-        {
-            try
-            {
-                Ticks startTime = DateTime.UtcNow.Ticks;
-                string configurationFile = FilePath.GetAbsolutePath(ConfigurationFileName);
-
-                // Attempt to load current configuration
-                ProxyConnectionCollection currentConfiguration = ProxyConnectionCollection.LoadConfiguration(configurationFile);
-
-                DisplayStatusMessage("Loaded {0} connections from \"{1}\".", UpdateType.Information, currentConfiguration.Count, configurationFile);
-
-                ProxyConnection[] newConnections;
-                ProxyConnection[] deletedConnections;
-                ProxyConnection[] updatedConnections;
-
-                if (m_currentConfiguration is null)
-                {
-                    // If no existing configuration exists, everything is assumed to be new
-                    newConnections = currentConfiguration.ToArray();
-                    deletedConnections = [];
-                    updatedConnections = [];
-                }
-                else
-                {
-                    // Compare loaded configuration to running configuration so needed adjustments can be made
-                    newConnections = currentConfiguration.Except(m_currentConfiguration, ProxyConnectionIDComparer.Default).ToArray();
-                    deletedConnections = m_currentConfiguration.Except(currentConfiguration, ProxyConnectionIDComparer.Default).ToArray();
-
-                    // Determine if any the loaded configurations have been updated
-                    IEnumerable<Guid> commonConnections = currentConfiguration.Intersect(m_currentConfiguration, ProxyConnectionIDComparer.Default).Select(connection => connection.ID);
-                    IEnumerable<ProxyConnection> currentConnections = m_currentConfiguration.Where(connection => commonConnections.Contains(connection.ID));
-                    IEnumerable<ProxyConnection> loadedConnections = currentConfiguration.Where(connection => commonConnections.Contains(connection.ID));
-
-                    // Updated proxy connections are any where field values may have changed
-                    updatedConnections = loadedConnections.Except(currentConnections, ProxyConnectionFieldComparer.Default).ToArray();
-                }
-
-                if (newConnections.Length > 0)
-                    DisplayStatusMessage("-- Detected {0} new connections in loaded configuration.", UpdateType.Information, newConnections.Length);
-
-                if (deletedConnections.Length > 0)
-                    DisplayStatusMessage("-- Detected {0} connections to be removed in loaded configuration.", UpdateType.Information, deletedConnections.Length);
-
-                if (updatedConnections.Length > 0)
-                    DisplayStatusMessage("-- Detected {0} updated connections in loaded configuration.", UpdateType.Information, updatedConnections.Length);
-
-                lock (m_streamSplitters)
-                {
-                    // Handle connection removals
-                    foreach (StreamProxy splitter in deletedConnections.Select(deletedConnection => m_streamSplitters.Find(s => s.ID == deletedConnection.ID)))
-                    {
-                        if (splitter is null)
-                            continue;
-
-                        splitter.Stop();
-                        splitter.Dispose();
-                        
-                        m_streamSplitters.Remove(splitter);
-                        m_serviceHelper.ServiceComponents.Remove(splitter);
-                    }
-
-                    // Handle connection additions
-                    foreach (ProxyConnection newConnection in newConnections)
-                    {
-                        StreamProxy splitter = new(newConnection);
-
-                        splitter.StatusMessage += splitter_StatusMessage;
-                        splitter.ProcessException += splitter_ProcessException;
-
-                        m_streamSplitters.Add(splitter);
-                        m_serviceHelper.ServiceComponents.Add(splitter);
-                    }
-
-                    // Handle connection updates
-                    foreach (ProxyConnection updatedConnection in updatedConnections)
-                    {
-                        StreamProxy splitter = m_streamSplitters.Find(s => s.ID == updatedConnection.ID);
-
-                        if (splitter is not null)
-                            splitter.ProxyConnection = updatedConnection;
-                    }
-                }
-
-                // Make loaded configuration the current configuration
-                m_currentConfiguration = currentConfiguration;
-
-                double elapsedTime = (DateTime.UtcNow.Ticks - startTime).ToSeconds();
-                DisplayStatusMessage("Configuration loaded and applied in {0}...", UpdateType.Information, elapsedTime < 0.01D ? "less than a second" : elapsedTime.ToString("0.00") + " seconds");
-
-            }
-            catch (Exception ex)
-            {
-                string message = $"Failed to load configuration : {ex.Message}";
-                HandleException(new InvalidOperationException(message, ex));
-            }
-            finally
-            {
-                // Release any waiting threads
-                m_configurationLoadComplete?.Set();
-            }
+            return true;
         }
 
         private void BackupConfiguration()
@@ -651,77 +408,79 @@ namespace StreamSplitter
             }
         }
 
-        #endregion
-
-        #region [ Service Command Handlers ]
-
-        // Attempts to restart the hose service.
-        private void RestartServiceHandler(ClientRequestInfo requestInfo)
+        /// <summary>
+        /// Displays a response message to client requester.
+        /// </summary>
+        /// <param name="requestInfo">
+        /// <see cref="ClientRequestInfo"/> instance containing the client request.
+        /// </param>
+        /// <param name="status">Formatted status message to send to client.</param>
+        /// <param name="args">Arguments of the formatted status message.</param>
+        private void DisplayResponseMessage(ClientRequestInfo requestInfo, string status, params object[] args)
         {
-            if (requestInfo.Request.Arguments.ContainsHelpRequest)
+            try
             {
-                StringBuilder helpMessage = new();
-
-                helpMessage.Append("Attempts to restart the host service.");
-                helpMessage.AppendLine();
-                helpMessage.AppendLine();
-                helpMessage.Append("   Usage:");
-                helpMessage.AppendLine();
-                helpMessage.Append("       Restart [Options]");
-                helpMessage.AppendLine();
-                helpMessage.AppendLine();
-                helpMessage.Append("   Options:");
-                helpMessage.AppendLine();
-                helpMessage.Append("       -?".PadRight(20));
-                helpMessage.Append("Displays this help message");
-
-                DisplayResponseMessage(requestInfo, helpMessage.ToString());
+                m_serviceHelper.UpdateStatus(requestInfo.Sender.ClientID, UpdateType.Information, $"{status}\r\n\r\n", args);
             }
-            else
+            catch (Exception ex)
             {
-                DisplayStatusMessage("Attempting to restart host service...", UpdateType.Information);
-
-                try
-                {
-                    ProcessStartInfo psi = new(ConsoleApplicationName)
-                    {
-                        CreateNoWindow = true,
-                        WindowStyle = ProcessWindowStyle.Hidden,
-                        UseShellExecute = false,
-                        Arguments = ServiceName + " -restart"
-                    };
-
-                    using (Process shell = new())
-                    {
-                        shell.StartInfo = psi;
-                        shell.Start();
-
-                        if (!shell.WaitForExit(30000))
-                            shell.Kill();
-                    }
-
-                    SendResponse(requestInfo, true);
-                }
-                catch (Exception ex)
-                {
-                    SendResponse(requestInfo, false, "Failed to restart host service: {0}", ex.Message);
-                    m_serviceHelper.ErrorLogger.Log(ex);
-                }
+                string message =
+                    $"Failed to update client status \"{status.ToNonNullString()}\" due to an exception: {ex.Message}";
+                HandleException(new InvalidOperationException(message, ex));
             }
         }
 
-        private void GetStreamProxyStatus(ClientRequestInfo requestInfo)
+        /// <summary>
+        /// Displays a broadcast message to all subscribed clients.
+        /// </summary>
+        /// <param name="status">Status message to send to all clients.</param>
+        /// <param name="type"><see cref="UpdateType"/> of message to send.</param>
+        private void DisplayStatusMessage(string status, UpdateType type)
+        {
+            try
+            {
+                status = status.Replace("{", "{{").Replace("}", "}}");
+                m_serviceHelper.UpdateStatus(type, $"{status}\r\n\r\n");
+            }
+            catch (Exception ex)
+            {
+                string message = $"Failed to update client status \"{status.ToNonNullString()}\" due to an exception: {ex.Message}";
+                HandleException(new InvalidOperationException(message, ex));
+            }
+        }
+
+        /// <summary>
+        /// Displays a broadcast message to all subscribed clients.
+        /// </summary>
+        /// <param name="status">Formatted status message to send to all clients.</param>
+        /// <param name="type"><see cref="UpdateType"/> of message to send.</param>
+        /// <param name="args">Arguments of the formatted status message.</param>
+        private void DisplayStatusMessage(string status, UpdateType type, params object[] args)
+        {
+            try
+            {
+                DisplayStatusMessage(string.Format(status, args), type);
+            }
+            catch (Exception ex)
+            {
+                string message = $"Failed to update client status \"{status.ToNonNullString()}\" due to an exception: {ex.Message}";
+                HandleException(new InvalidOperationException(message, ex));
+            }
+        }
+
+        // Send the current configuration to requester
+        private void DownloadConfigurationHandler(ClientRequestInfo requestInfo)
         {
             if (requestInfo.Request.Arguments.ContainsHelpRequest)
             {
                 StringBuilder helpMessage = new();
 
-                helpMessage.Append("Gets current status for all stream proxies.");
+                helpMessage.Append("Provides the current configuration to requester.");
                 helpMessage.AppendLine();
                 helpMessage.AppendLine();
                 helpMessage.Append("   Usage:");
                 helpMessage.AppendLine();
-                helpMessage.Append("       GetStreamProxyStatus [Options]");
+                helpMessage.Append("       DownloadConfig [Options]");
                 helpMessage.AppendLine();
                 helpMessage.AppendLine();
                 helpMessage.Append("   Options:");
@@ -733,15 +492,9 @@ namespace StreamSplitter
             }
             else
             {
-                // Send current status all stream proxies
-                StreamProxyStatus[] streamProxies;
-
-                lock (m_streamSplitters)
-                {
-                    streamProxies = m_streamSplitters.Select(splitter => splitter.StreamProxyStatus).ToArray();
-                }
-
-                SendResponseWithAttachment(requestInfo, true, streamProxies, null);
+                // Send current running configuration back to requester
+                SendResponseWithAttachment(requestInfo, true, ProxyConnectionCollection.SerializeConfiguration(m_currentConfiguration), null);
+                DisplayStatusMessage("Running configuration sent to requester.", UpdateType.Information);
             }
         }
 
@@ -770,7 +523,7 @@ namespace StreamSplitter
             }
             else
             {
-                // Send current status all stream proxies                
+                // Send current status all stream proxies
                 StringBuilder splitterEnumeration = new();
                 StreamProxy splitter = null;
 
@@ -827,6 +580,314 @@ namespace StreamSplitter
 
                 if (splitterEnumeration.Length > 0)
                     DisplayResponseMessage(requestInfo, splitterEnumeration.ToString());
+            }
+        }
+
+        // Executes actual deserialization of current configuration
+        private void ExecuteConfigurationLoad(object state)
+        {
+            try
+            {
+                Ticks startTime = DateTime.UtcNow.Ticks;
+                string configurationFile = FilePath.GetAbsolutePath(ConfigurationFileName);
+
+                // Attempt to load current configuration
+                ProxyConnectionCollection currentConfiguration = ProxyConnectionCollection.LoadConfiguration(configurationFile);
+
+                DisplayStatusMessage("Loaded {0} connections from \"{1}\".", UpdateType.Information, currentConfiguration.Count, configurationFile);
+
+                ProxyConnection[] newConnections;
+                ProxyConnection[] deletedConnections;
+                ProxyConnection[] updatedConnections;
+
+                if (m_currentConfiguration is null)
+                {
+                    // If no existing configuration exists, everything is assumed to be new
+                    newConnections = currentConfiguration.ToArray();
+                    deletedConnections = [];
+                    updatedConnections = [];
+                }
+                else
+                {
+                    // Compare loaded configuration to running configuration so needed adjustments
+                    // can be made
+                    newConnections = currentConfiguration.Except(m_currentConfiguration, ProxyConnectionIDComparer.Default).ToArray();
+                    deletedConnections = m_currentConfiguration.Except(currentConfiguration, ProxyConnectionIDComparer.Default).ToArray();
+
+                    // Determine if any the loaded configurations have been updated
+                    IEnumerable<Guid> commonConnections = currentConfiguration.Intersect(m_currentConfiguration, ProxyConnectionIDComparer.Default).Select(connection => connection.ID);
+                    IEnumerable<ProxyConnection> currentConnections = m_currentConfiguration.Where(connection => commonConnections.Contains(connection.ID));
+                    IEnumerable<ProxyConnection> loadedConnections = currentConfiguration.Where(connection => commonConnections.Contains(connection.ID));
+
+                    // Updated proxy connections are any where field values may have changed
+                    updatedConnections = loadedConnections.Except(currentConnections, ProxyConnectionFieldComparer.Default).ToArray();
+                }
+
+                if (newConnections.Length > 0)
+                    DisplayStatusMessage("-- Detected {0} new connections in loaded configuration.", UpdateType.Information, newConnections.Length);
+
+                if (deletedConnections.Length > 0)
+                    DisplayStatusMessage("-- Detected {0} connections to be removed in loaded configuration.", UpdateType.Information, deletedConnections.Length);
+
+                if (updatedConnections.Length > 0)
+                    DisplayStatusMessage("-- Detected {0} updated connections in loaded configuration.", UpdateType.Information, updatedConnections.Length);
+
+                lock (m_streamSplitters)
+                {
+                    // Handle connection removals
+                    foreach (StreamProxy splitter in deletedConnections.Select(deletedConnection => m_streamSplitters.Find(s => s.ID == deletedConnection.ID)))
+                    {
+                        if (splitter is null)
+                            continue;
+
+                        splitter.Stop();
+                        splitter.Dispose();
+
+                        m_streamSplitters.Remove(splitter);
+                        m_serviceHelper.ServiceComponents.Remove(splitter);
+                    }
+
+                    // Handle connection additions
+                    foreach (ProxyConnection newConnection in newConnections)
+                    {
+                        StreamProxy splitter = new(newConnection);
+
+                        splitter.StatusMessage += splitter_StatusMessage;
+                        splitter.ProcessException += splitter_ProcessException;
+
+                        m_streamSplitters.Add(splitter);
+                        m_serviceHelper.ServiceComponents.Add(splitter);
+                    }
+
+                    // Handle connection updates
+                    foreach (ProxyConnection updatedConnection in updatedConnections)
+                    {
+                        StreamProxy splitter = m_streamSplitters.Find(s => s.ID == updatedConnection.ID);
+
+                        if (splitter is not null)
+                            splitter.ProxyConnection = updatedConnection;
+                    }
+                }
+
+                // Make loaded configuration the current configuration
+                m_currentConfiguration = currentConfiguration;
+
+                double elapsedTime = (DateTime.UtcNow.Ticks - startTime).ToSeconds();
+                DisplayStatusMessage("Configuration loaded and applied in {0}...", UpdateType.Information, elapsedTime < 0.01D ? "less than a second" : elapsedTime.ToString("0.00") + " seconds");
+            }
+            catch (Exception ex)
+            {
+                string message = $"Failed to load configuration : {ex.Message}";
+                HandleException(new InvalidOperationException(message, ex));
+            }
+            finally
+            {
+                // Release any waiting threads
+                m_configurationLoadComplete?.Set();
+            }
+        }
+
+        // Gets derived name of specified object.
+        private string GetDerivedName(object sender)
+        {
+            return m_derivedNameCache.GetOrAdd(sender, key =>
+            {
+                string name;
+
+                if (key is IProvideStatus statusProvider)
+                    name = statusProvider.Name;
+                else
+                    name = key as string;
+
+                if (string.IsNullOrWhiteSpace(name))
+                    name = key.GetType().Name;
+
+                return name;
+            });
+        }
+
+        private void GetStreamProxyStatus(ClientRequestInfo requestInfo)
+        {
+            if (requestInfo.Request.Arguments.ContainsHelpRequest)
+            {
+                StringBuilder helpMessage = new();
+
+                helpMessage.Append("Gets current status for all stream proxies.");
+                helpMessage.AppendLine();
+                helpMessage.AppendLine();
+                helpMessage.Append("   Usage:");
+                helpMessage.AppendLine();
+                helpMessage.Append("       GetStreamProxyStatus [Options]");
+                helpMessage.AppendLine();
+                helpMessage.AppendLine();
+                helpMessage.Append("   Options:");
+                helpMessage.AppendLine();
+                helpMessage.Append("       -?".PadRight(20));
+                helpMessage.Append("Displays this help message");
+
+                DisplayResponseMessage(requestInfo, helpMessage.ToString());
+            }
+            else
+            {
+                // Send current status all stream proxies
+                StreamProxyStatus[] streamProxies;
+
+                lock (m_streamSplitters)
+                {
+                    streamProxies = m_streamSplitters.Select(splitter => splitter.StreamProxyStatus).ToArray();
+                }
+
+                SendResponseWithAttachment(requestInfo, true, streamProxies, null);
+            }
+        }
+
+        // Send the error to the service helper and error logger
+        private void HandleException(Exception ex)
+        {
+            string newLines = string.Format("{0}{0}", Environment.NewLine);
+
+            m_serviceHelper.ErrorLogger.Log(ex);
+            m_serviceHelper.UpdateStatus(UpdateType.Alarm, ex.Message + newLines);
+        }
+
+        /// <summary>
+        /// Loads the current system configuration.
+        /// </summary>
+        /// <remarks>
+        /// This method handles loading of the current system configuration one request at once.
+        /// </remarks>
+        private void LoadCurrentConfiguration()
+        {
+            try
+            {
+                // Queue configuration deserialization
+                ThreadPool.QueueUserWorkItem(QueueConfigurationLoad);
+            }
+            catch (Exception ex)
+            {
+                string message = $"Failed to queue configuration load due to exception: {ex.Message}";
+                HandleException(new InvalidOperationException(message, ex));
+            }
+        }
+
+        // Event handler for processing exceptions encountered while writing entries to a log file.
+        private void LogExceptionHandler(object sender, EventArgs<Exception> e)
+        {
+            DisplayStatusMessage("Log file exception: " + e.Argument.Message, UpdateType.Alarm);
+        }
+
+        // Since configuration deserialization might take a while, we queue-up activity for
+        // one-at-a-time processing
+        private void QueueConfigurationLoad(object state)
+        {
+            // Queue up a configuration cache unless another thread has already requested one
+            if (!Monitor.TryEnter(m_queuedConfigurationLoadPending, 500))
+                return;
+
+            try
+            {
+                // Queue new configuration load after waiting for any prior cache operation to complete
+                if (m_configurationLoadComplete.WaitOne())
+                {
+                    try
+                    {
+                        // Queue up task to execute load of the latest configuration
+                        ThreadPool.QueueUserWorkItem(ExecuteConfigurationLoad);
+                    }
+                    catch (Exception ex)
+                    {
+                        string message = $"Failed to queue configuration load process due to exception: {ex.Message}";
+                        HandleException(new InvalidOperationException(message, ex));
+                    }
+                }
+            }
+            finally
+            {
+                Monitor.Exit(m_queuedConfigurationLoadPending);
+            }
+        }
+
+        // Reload the current configuration
+        private void ReloadConfigurationHandler(ClientRequestInfo requestInfo)
+        {
+            if (requestInfo.Request.Arguments.ContainsHelpRequest)
+            {
+                StringBuilder helpMessage = new();
+
+                helpMessage.Append("Reloads the current configuration.");
+                helpMessage.AppendLine();
+                helpMessage.AppendLine();
+                helpMessage.Append("   Usage:");
+                helpMessage.AppendLine();
+                helpMessage.Append("       ReloadConfig [Options]");
+                helpMessage.AppendLine();
+                helpMessage.AppendLine();
+                helpMessage.Append("   Options:");
+                helpMessage.AppendLine();
+                helpMessage.Append("       -?".PadRight(20));
+                helpMessage.Append("Displays this help message");
+
+                DisplayResponseMessage(requestInfo, helpMessage.ToString());
+            }
+            else
+            {
+                LoadCurrentConfiguration();
+                SendResponse(requestInfo, true);
+            }
+        }
+
+        // Attempts to restart the hose service.
+        private void RestartServiceHandler(ClientRequestInfo requestInfo)
+        {
+            if (requestInfo.Request.Arguments.ContainsHelpRequest)
+            {
+                StringBuilder helpMessage = new();
+
+                helpMessage.Append("Attempts to restart the host service.");
+                helpMessage.AppendLine();
+                helpMessage.AppendLine();
+                helpMessage.Append("   Usage:");
+                helpMessage.AppendLine();
+                helpMessage.Append("       Restart [Options]");
+                helpMessage.AppendLine();
+                helpMessage.AppendLine();
+                helpMessage.Append("   Options:");
+                helpMessage.AppendLine();
+                helpMessage.Append("       -?".PadRight(20));
+                helpMessage.Append("Displays this help message");
+
+                DisplayResponseMessage(requestInfo, helpMessage.ToString());
+            }
+            else
+            {
+                DisplayStatusMessage("Attempting to restart host service...", UpdateType.Information);
+
+                try
+                {
+                    ProcessStartInfo psi = new(ConsoleApplicationName)
+                    {
+                        CreateNoWindow = true,
+                        WindowStyle = ProcessWindowStyle.Hidden,
+                        UseShellExecute = false,
+                        Arguments = ServiceName + " -restart"
+                    };
+
+                    using (Process shell = new())
+                    {
+                        shell.StartInfo = psi;
+                        shell.Start();
+
+                        if (!shell.WaitForExit(30000))
+                            shell.Kill();
+                    }
+
+                    SendResponse(requestInfo, true);
+                }
+                catch (Exception ex)
+                {
+                    SendResponse(requestInfo, false, "Failed to restart host service: {0}", ex.Message);
+                    m_serviceHelper.ErrorLogger.Log(ex);
+                }
             }
         }
 
@@ -912,64 +973,390 @@ namespace StreamSplitter
             }
         }
 
-        // Reload the current configuration
-        private void ReloadConfigurationHandler(ClientRequestInfo requestInfo)
+        /// <summary>
+        /// Sends an actionable response to client.
+        /// </summary>
+        /// <param name="requestInfo">
+        /// <see cref="ClientRequestInfo"/> instance containing the client request.
+        /// </param>
+        /// <param name="success">
+        /// Flag that determines if this response to client request was a success.
+        /// </param>
+        private void SendResponse(ClientRequestInfo requestInfo, bool success)
         {
-            if (requestInfo.Request.Arguments.ContainsHelpRequest)
+            SendResponseWithAttachment(requestInfo, success, null, null);
+        }
+
+        /// <summary>
+        /// Sends an actionable response to client with a formatted message.
+        /// </summary>
+        /// <param name="requestInfo">
+        /// <see cref="ClientRequestInfo"/> instance containing the client request.
+        /// </param>
+        /// <param name="success">
+        /// Flag that determines if this response to client request was a success.
+        /// </param>
+        /// <param name="status">Formatted status message to send with response.</param>
+        /// <param name="args">Arguments of the formatted status message.</param>
+        private void SendResponse(ClientRequestInfo requestInfo, bool success, string status, params object[] args)
+        {
+            SendResponseWithAttachment(requestInfo, success, null, status, args);
+        }
+
+        /// <summary>
+        /// Sends an actionable response to client with a formatted message and attachment.
+        /// </summary>
+        /// <param name="requestInfo">
+        /// <see cref="ClientRequestInfo"/> instance containing the client request.
+        /// </param>
+        /// <param name="success">
+        /// Flag that determines if this response to client request was a success.
+        /// </param>
+        /// <param name="attachment">Attachment to send with response.</param>
+        /// <param name="status">Formatted status message to send with response.</param>
+        /// <param name="args">Arguments of the formatted status message.</param>
+        private void SendResponseWithAttachment(ClientRequestInfo requestInfo, bool success, object attachment, string status, params object[] args)
+        {
+            try
             {
-                StringBuilder helpMessage = new();
+                // Send actionable response
+                m_serviceHelper.SendActionableResponse(requestInfo, success, attachment, status, args);
 
-                helpMessage.Append("Reloads the current configuration.");
-                helpMessage.AppendLine();
-                helpMessage.AppendLine();
-                helpMessage.Append("   Usage:");
-                helpMessage.AppendLine();
-                helpMessage.Append("       ReloadConfig [Options]");
-                helpMessage.AppendLine();
-                helpMessage.AppendLine();
-                helpMessage.Append("   Options:");
-                helpMessage.AppendLine();
-                helpMessage.Append("       -?".PadRight(20));
-                helpMessage.Append("Displays this help message");
+                if (m_serviceHelper.LogStatusUpdates && m_serviceHelper.StatusLog.IsOpen)
+                {
+                    string responseType = requestInfo.Request.Command + (success ? ":Success" : ":Failure");
+                    string arguments = requestInfo.Request.Arguments.ToString();
+                    string message = responseType + (string.IsNullOrWhiteSpace(arguments) ? "" : "(" + arguments + ")");
 
-                DisplayResponseMessage(requestInfo, helpMessage.ToString());
+                    if (status is not null)
+                    {
+                        if (args.Length == 0)
+                            message += " - " + status;
+                        else
+                            message += " - " + string.Format(status, args);
+                    }
+
+                    // Log details of client request as well as response
+                    m_serviceHelper.StatusLog.WriteTimestampedLine(message);
+                }
             }
-            else
+            catch (Exception ex)
             {
-                LoadCurrentConfiguration();
-                SendResponse(requestInfo, true);
+                string message = $"Failed to send client response due to an exception: {ex.Message}";
+                HandleException(new InvalidOperationException(message, ex));
             }
         }
 
-        // Send the current configuration to requester
-        private void DownloadConfigurationHandler(ClientRequestInfo requestInfo)
+        // Handle auto-health display.
+        private void ServiceHeartbeatHandler(string s, object[] args)
         {
-            if (requestInfo.Request.Arguments.ContainsHelpRequest)
+            const string requestCommand = "Health";
+            ClientRequestHandler requestHandler = m_serviceHelper.FindClientRequestHandler(requestCommand);
+
+            // Send a "Health" command to ourselves on heart-beat schedule...
+            requestHandler?.HandlerMethod(ClientHelper.PretendRequest(requestCommand));
+        }
+
+        private void ServiceHelper_ServiceStarted(object sender, EventArgs e)
+        {
+            // Define a line of asterisks for emphasis
+            string stars = new('*', 79);
+
+            // Log startup information
+            m_serviceHelper.UpdateStatus(
+                UpdateType.Information,
+                "\r\n\r\n{0}\r\n\r\n" +
+                "     System Time: {1} UTC\r\n\r\n" +
+                "    Current Path: {2}\r\n\r\n" +
+                "    Machine Name: {3}\r\n\r\n" +
+                "      OS Version: {4}\r\n\r\n" +
+                "    Product Name: {5}\r\n\r\n" +
+                "  Working Memory: {6}\r\n\r\n" +
+                "  Execution Mode: {7}-bit\r\n\r\n" +
+                "      Processors: {8}\r\n\r\n" +
+                "  GC Server Mode: {9}\r\n\r\n" +
+                " GC Latency Mode: {10}\r\n\r\n" +
+                " Process Account: {11}\\{12}\r\n\r\n" +
+                "{13}\r\n",
+                stars,
+                DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                FilePath.TrimFileName(FilePath.RemovePathSuffix(FilePath.GetAbsolutePath("")), 61),
+                Environment.MachineName,
+                Environment.OSVersion.VersionString,
+                Registry.GetValue("HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ProductName", null).ToNonNullString("<Unavailable>"),
+                SI2.ToScaledString(Environment.WorkingSet, 3, "B", SI2.IECSymbols),
+                IntPtr.Size * 8,
+                Environment.ProcessorCount,
+                GCSettings.IsServerGC,
+                GCSettings.LatencyMode,
+                Environment.UserDomainName,
+                Environment.UserName,
+                stars);
+
+            // Set up heartbeat as a scheduled service
+            m_serviceHelper.AddScheduledProcess(ServiceHeartbeatHandler, "ServiceHeartbeat", "* * * * *");
+
+            // Setup custom service commands
+            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("Restart", "Attempts to restart the host service", RestartServiceHandler));
+            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("GetStreamProxyStatus", "Gets current status for all stream proxies", GetStreamProxyStatus));
+            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("ReloadConfig", "Reloads the current configuration", ReloadConfigurationHandler));
+            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("DownloadConfig", "Provides the current configuration to requester", DownloadConfigurationHandler));
+            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("UploadConfig", "Deserializes and loads received configuration", UploadConfigurationHandler));
+            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("UploadConnection", "Applies received proxy connection to running configuration", UploadConnectionHandler));
+            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("EnumerateSplitters", "Enumerates all stream splitters", EnumerateSplittersHandler, new[] { "list", "dir", "ls" }));
+            m_serviceHelper.ClientRequestHandlers.Add(new ClientRequestHandler("SendCommand", "Sends command to a specific stream splitter", SendCommandHandler));
+
+            LoadCurrentConfiguration();
+            TryStartWebHosting();
+        }
+
+        private void ServiceHelper_ServiceStarting(object sender, EventArgs<string[]> e)
+        {
+            // Make sure default service settings exist
+            ConfigurationFile configFile = ConfigurationFile.Current;
+
+            string servicePath = FilePath.GetAbsolutePath("");
+            string defaultLogPath = string.Format("{0}{1}Logs{1}", servicePath, Path.DirectorySeparatorChar);
+
+            // System settings
+            CategorizedSettingsElementCollection systemSettings = configFile.Settings["systemSettings"];
+            systemSettings.Add("SocketErrorReportingInterval", "10", "Interval, in seconds, that defines the maximum reporting rate for duplicate exceptions on a connection.");
+            systemSettings.Add("MinThreadPoolWorkerThreads", DefaultMinThreadPoolWorkerSize, "Defines the minimum number of allowed thread pool worker threads.");
+            systemSettings.Add("MaxThreadPoolWorkerThreads", DefaultMaxThreadPoolWorkerSize, "Defines the maximum number of allowed thread pool worker threads.");
+            systemSettings.Add("MinThreadPoolIOPortThreads", DefaultMinThreadPoolIOPortSize, "Defines the minimum number of allowed thread pool I/O completion port threads (used by socket layer).");
+            systemSettings.Add("MaxThreadPoolIOPortThreads", DefaultMaxThreadPoolIOPortSize, "Defines the maximum number of allowed thread pool I/O completion port threads (used by socket layer).");
+            systemSettings.Add("LogPath", defaultLogPath, "Defines the path used to archive log files");
+            systemSettings.Add("MaxLogFiles", DefaultMaxLogFiles, "Defines the maximum number of log files to keep");
+            systemSettings.Add("DefaultCulture", "en-US", "Default culture to use for language, country/region and calendar formats.");
+            systemSettings.Add("WebHostingEnabled", DefaultWebHostingEnabled, "Flag that determines if the web API hosting is enabled.");
+            systemSettings.Add("WebHostURL", DefaultWebHostURL, "URL endpoint where the Stream Splitter web API is hosted.");
+            systemSettings.Add("AuthenticationSchemes", DefaultAuthenticationScheme, "Authentication scheme required by clients accessing the web API. Only \"Anonymous\" is currently supported; any other configured value prevents the web API from starting instead of silently falling back to anonymous access.");
+            systemSettings.Add("AnonymousResourceExpression", DefaultAnonymousResourceExpression, "Regular expression matching web API resource paths accessible without credentials. Validated at startup; has no runtime effect yet since only the Anonymous scheme is implemented.");
+            systemSettings.Add("MaxImportFileSizeBytes", DefaultMaxImportFileSizeBytes, "Maximum allowed size, in bytes, of a configuration file accepted by the connections import endpoint.");
+
+            // Create a handler for unobserved task exceptions
+            TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
+
+            // Attempt to set default culture
+            try
             {
-                StringBuilder helpMessage = new();
-
-                helpMessage.Append("Provides the current configuration to requester.");
-                helpMessage.AppendLine();
-                helpMessage.AppendLine();
-                helpMessage.Append("   Usage:");
-                helpMessage.AppendLine();
-                helpMessage.Append("       DownloadConfig [Options]");
-                helpMessage.AppendLine();
-                helpMessage.AppendLine();
-                helpMessage.Append("   Options:");
-                helpMessage.AppendLine();
-                helpMessage.Append("       -?".PadRight(20));
-                helpMessage.Append("Displays this help message");
-
-                DisplayResponseMessage(requestInfo, helpMessage.ToString());
+                string defaultCulture = systemSettings["DefaultCulture"].ValueAs("en-US");
+                CultureInfo.DefaultThreadCurrentCulture = CultureInfo.CreateSpecificCulture(defaultCulture);     // Defaults for date formatting, etc.
+                CultureInfo.DefaultThreadCurrentUICulture = CultureInfo.CreateSpecificCulture(defaultCulture);   // Culture for resource strings, etc.
             }
-            else
+            catch (Exception ex)
             {
-                // Send current running configuration back to requester
-                SendResponseWithAttachment(requestInfo, true, ProxyConnectionCollection.SerializeConfiguration(m_currentConfiguration), null);
-                DisplayStatusMessage("Running configuration sent to requester.", UpdateType.Information);
+                DisplayStatusMessage("Failed to set default culture due to exception, defaulting to \"{1}\": {0}", UpdateType.Alarm, ex.Message, CultureInfo.CurrentCulture.Name.ToNonNullNorEmptyString("Undetermined"));
+                Logger.SwallowException(ex);
+            }
+
+            // Retrieve application log path as defined in the config file
+            string logPath = FilePath.GetAbsolutePath(systemSettings["LogPath"].Value);
+
+            // Make sure log directory exists
+            try
+            {
+                if (!Directory.Exists(logPath))
+                    Directory.CreateDirectory(logPath);
+            }
+            catch (Exception ex)
+            {
+                // Attempt to default back to common log file path
+                if (!Directory.Exists(defaultLogPath))
+                {
+                    try
+                    {
+                        Directory.CreateDirectory(defaultLogPath);
+                    }
+                    catch
+                    {
+                        defaultLogPath = servicePath;
+                    }
+                }
+
+                DisplayStatusMessage("Failed to create logging directory \"{0}\" due to exception, defaulting to \"{1}\": {2}", UpdateType.Alarm, logPath, defaultLogPath, ex.Message);
+                Logger.SwallowException(ex);
+                logPath = defaultLogPath;
+            }
+
+            int maxLogFiles = systemSettings["MaxLogFiles"].ValueAs(DefaultMaxLogFiles);
+
+            try
+            {
+                Logger.FileWriter.SetPath(logPath);
+                Logger.FileWriter.SetLoggingFileCount(maxLogFiles);
+            }
+            catch (Exception ex)
+            {
+                DisplayStatusMessage("Failed to set logging path \"{0}\" or max file count \"{1}\" due to exception: {2}", UpdateType.Alarm, logPath, maxLogFiles, ex.Message);
+                Logger.SwallowException(ex);
+            }
+
+            // Setup default thread pool size
+            try
+            {
+                ThreadPool.SetMinThreads(systemSettings["MinThreadPoolWorkerThreads"].ValueAs(DefaultMinThreadPoolWorkerSize), systemSettings["MinThreadPoolIOPortThreads"].ValueAs(DefaultMinThreadPoolIOPortSize));
+                ThreadPool.SetMaxThreads(systemSettings["MaxThreadPoolWorkerThreads"].ValueAs(DefaultMaxThreadPoolWorkerSize), systemSettings["MaxThreadPoolIOPortThreads"].ValueAs(DefaultMaxThreadPoolIOPortSize));
+            }
+            catch (Exception ex)
+            {
+                DisplayStatusMessage("Failed to set desired thread pool size due to exception: {0}", UpdateType.Alarm, ex.Message);
+                Logger.SwallowException(ex);
+            }
+
+            // Initialize system settings
+            m_configurationLoadComplete = new AutoResetEvent(true);
+            m_queuedConfigurationLoadPending = new object();
+
+            lock (m_streamSplitters)
+            {
+                m_streamSplitters.Clear();
             }
         }
+
+        private void ServiceHelper_ServiceStopping(object sender, EventArgs e)
+        {
+            // Stop web API host before stream splitters so no new requests arrive during shutdown
+            m_webAppHost?.Dispose();
+            m_webAppHost = null;
+
+            lock (m_streamSplitters)
+            {
+                foreach (StreamProxy splitter in m_streamSplitters)
+                {
+                    splitter.Stop();
+                    splitter.Dispose();
+                    m_serviceHelper.ServiceComponents.Remove(splitter);
+                }
+            }
+
+            m_serviceHelper.ServiceStarting -= ServiceHelper_ServiceStarting;
+            m_serviceHelper.ServiceStarted -= ServiceHelper_ServiceStarted;
+            m_serviceHelper.ServiceStopping -= ServiceHelper_ServiceStopping;
+
+            if (m_serviceHelper.StatusLog is not null)
+            {
+                m_serviceHelper.StatusLog.Flush();
+                m_serviceHelper.StatusLog.LogException -= LogExceptionHandler;
+            }
+
+            if (m_serviceHelper.ErrorLogger is not null && m_serviceHelper.ErrorLogger.ErrorLog is not null)
+            {
+                m_serviceHelper.ErrorLogger.ErrorLog.Flush();
+                m_serviceHelper.ErrorLogger.ErrorLog.LogException -= LogExceptionHandler;
+            }
+
+            if (m_configurationLoadComplete is not null)
+            {
+                // Release any waiting threads before disposing wait handle
+                m_configurationLoadComplete.Set();
+                m_configurationLoadComplete.Dispose();
+            }
+
+            m_configurationLoadComplete = null;
+
+            // Unattach from handler for unobserved task exceptions
+            TaskScheduler.UnobservedTaskException -= TaskScheduler_UnobservedTaskException;
+
+            Current = null;
+        }
+
+        private void splitter_ProcessException(object sender, EventArgs<Exception> e)
+        {
+            HandleException(new InvalidOperationException(
+                $"[{GetDerivedName(sender)}] Stream splitter exception: {e.Argument.Message}", e.Argument));
+        }
+
+        private void splitter_StatusMessage(object sender, EventArgs<string> e)
+        {
+            DisplayStatusMessage("[{0}] {1}", UpdateType.Information, GetDerivedName(sender), e.Argument);
+        }
+
+        // Handle task scheduler exceptions
+        private void TaskScheduler_UnobservedTaskException(object sender, UnobservedTaskExceptionEventArgs e)
+        {
+            foreach (Exception ex in e.Exception.Flatten().InnerExceptions)
+            {
+                m_serviceHelper.ErrorLogger.Log(ex, false);
+            }
+
+            e.SetObserved();
+        }
+
+        // Starts the OWIN-based web API host using settings from the configuration file.
+        private void TryStartWebHosting()
+        {
+            try
+            {
+                CategorizedSettingsElementCollection systemSettings =
+                    ConfigurationFile.Current.Settings["systemSettings"];
+
+                if (!systemSettings["WebHostingEnabled"].ValueAs(DefaultWebHostingEnabled))
+                {
+                    DisplayStatusMessage("Web API hosting is disabled per configuration.", UpdateType.Information);
+                    return;
+                }
+
+                // Fail secure: refuse to start the web API rather than silently exposing it
+                // anonymously when an unsupported authentication scheme is configured.
+                string authenticationScheme = systemSettings["AuthenticationSchemes"].ValueAs(DefaultAuthenticationScheme);
+
+                if (!IsAuthenticationSchemeSupported(authenticationScheme))
+                {
+                    DisplayStatusMessage(
+                        "Web API hosting was not started: authentication scheme \"{0}\" is not supported. Only \"{1}\" is currently implemented - refusing to expose the API rather than falling back to anonymous access.",
+                        UpdateType.Alarm,
+                        authenticationScheme.ToNonNullString("<empty>"),
+                        DefaultAuthenticationScheme);
+
+                    return;
+                }
+
+                // AnonymousResourceExpression has no consumer yet since Anonymous is the only
+                // implemented scheme, but its shape is still validated so a malformed value is
+                // caught at startup rather than the first time a future scheme relies on it.
+                string anonymousResourceExpression = systemSettings["AnonymousResourceExpression"].ValueAs(DefaultAnonymousResourceExpression);
+
+                try
+                {
+                    _ = new Regex(anonymousResourceExpression);
+                }
+                catch (ArgumentException ex)
+                {
+                    DisplayStatusMessage(
+                        "Configured AnonymousResourceExpression \"{0}\" is not a valid regular expression: {1}. This setting has no effect while the Anonymous authentication scheme is active.",
+                        UpdateType.Warning,
+                        anonymousResourceExpression.ToNonNullString("<empty>"),
+                        ex.Message);
+                }
+
+                string webHostURL = systemSettings["WebHostURL"].ValueAs(DefaultWebHostURL);
+
+                m_webAppHost = WebApp.Start<Startup>(webHostURL);
+
+                DisplayStatusMessage(
+                    "Web API hosting started at \"{0}\" using the \"{1}\" authentication scheme. Swagger UI: {0}/swagger",
+                    UpdateType.Information,
+                    webHostURL,
+                    authenticationScheme);
+            }
+            catch (Exception ex)
+            {
+                DisplayStatusMessage(
+                    "Failed to start web API hosting due to exception: {0}",
+                    UpdateType.Alarm,
+                    ex.Message);
+
+                Logger.SwallowException(ex);
+            }
+        }
+
+        #endregion [ Service Event Handlers ]
+
+        #region [ Configuration Management ]
+        #endregion [ Configuration Management ]
+
+        #region [ Service Command Handlers ]
 
         // Apply the received configuration to as the running configuration
         private void UploadConfigurationHandler(ClientRequestInfo requestInfo)
@@ -1126,271 +1513,16 @@ namespace StreamSplitter
             }
         }
 
-        #endregion
+        #endregion [ Service Command Handlers ]
 
         #region [ Stream Splitter Event Handlers ]
-
-        private void splitter_StatusMessage(object sender, EventArgs<string> e)
-        {
-            DisplayStatusMessage("[{0}] {1}", UpdateType.Information, GetDerivedName(sender), e.Argument);
-        }
-
-        private void splitter_ProcessException(object sender, EventArgs<Exception> e)
-        {
-            HandleException(new InvalidOperationException(
-                $"[{GetDerivedName(sender)}] Stream splitter exception: {e.Argument.Message}", e.Argument));
-        }
-
-        #endregion
+        #endregion [ Stream Splitter Event Handlers ]
 
         #region [ Broadcast Message Handling ]
-
-        /// <summary>
-        /// Sends an actionable response to client.
-        /// </summary>
-        /// <param name="requestInfo"><see cref="ClientRequestInfo"/> instance containing the client request.</param>
-        /// <param name="success">Flag that determines if this response to client request was a success.</param>
-        private void SendResponse(ClientRequestInfo requestInfo, bool success)
-        {
-            SendResponseWithAttachment(requestInfo, success, null, null);
-        }
-
-        /// <summary>
-        /// Sends an actionable response to client with a formatted message.
-        /// </summary>
-        /// <param name="requestInfo"><see cref="ClientRequestInfo"/> instance containing the client request.</param>
-        /// <param name="success">Flag that determines if this response to client request was a success.</param>
-        /// <param name="status">Formatted status message to send with response.</param>
-        /// <param name="args">Arguments of the formatted status message.</param>
-        private void SendResponse(ClientRequestInfo requestInfo, bool success, string status, params object[] args)
-        {
-            SendResponseWithAttachment(requestInfo, success, null, status, args);
-        }
-
-        /// <summary>
-        /// Sends an actionable response to client with a formatted message and attachment.
-        /// </summary>
-        /// <param name="requestInfo"><see cref="ClientRequestInfo"/> instance containing the client request.</param>
-        /// <param name="success">Flag that determines if this response to client request was a success.</param>
-        /// <param name="attachment">Attachment to send with response.</param>
-        /// <param name="status">Formatted status message to send with response.</param>
-        /// <param name="args">Arguments of the formatted status message.</param>
-        private void SendResponseWithAttachment(ClientRequestInfo requestInfo, bool success, object attachment, string status, params object[] args)
-        {
-            try
-            {
-                // Send actionable response
-                m_serviceHelper.SendActionableResponse(requestInfo, success, attachment, status, args);
-
-                if (m_serviceHelper.LogStatusUpdates && m_serviceHelper.StatusLog.IsOpen)
-                {
-                    string responseType = requestInfo.Request.Command + (success ? ":Success" : ":Failure");
-                    string arguments = requestInfo.Request.Arguments.ToString();
-                    string message = responseType + (string.IsNullOrWhiteSpace(arguments) ? "" : "(" + arguments + ")");
-
-                    if (status is not null)
-                    {
-                        if (args.Length == 0)
-                            message += " - " + status;
-                        else
-                            message += " - " + string.Format(status, args);
-                    }
-
-                    // Log details of client request as well as response
-                    m_serviceHelper.StatusLog.WriteTimestampedLine(message);
-                }
-            }
-            catch (Exception ex)
-            {
-                string message = $"Failed to send client response due to an exception: {ex.Message}";
-                HandleException(new InvalidOperationException(message, ex));
-            }
-        }
-
-        /// <summary>
-        /// Displays a response message to client requester.
-        /// </summary>
-        /// <param name="requestInfo"><see cref="ClientRequestInfo"/> instance containing the client request.</param>
-        /// <param name="status">Formatted status message to send to client.</param>
-        /// <param name="args">Arguments of the formatted status message.</param>
-        private void DisplayResponseMessage(ClientRequestInfo requestInfo, string status, params object[] args)
-        {
-            try
-            {
-                m_serviceHelper.UpdateStatus(requestInfo.Sender.ClientID, UpdateType.Information, $"{status}\r\n\r\n", args);
-            }
-            catch (Exception ex)
-            {
-                string message =
-                    $"Failed to update client status \"{status.ToNonNullString()}\" due to an exception: {ex.Message}";
-                HandleException(new InvalidOperationException(message, ex));
-            }
-        }
-
-        /// <summary>
-        /// Displays a broadcast message to all subscribed clients.
-        /// </summary>
-        /// <param name="status">Status message to send to all clients.</param>
-        /// <param name="type"><see cref="UpdateType"/> of message to send.</param>
-        private void DisplayStatusMessage(string status, UpdateType type)
-        {
-            try
-            {
-                status = status.Replace("{", "{{").Replace("}", "}}");
-                m_serviceHelper.UpdateStatus(type, $"{status}\r\n\r\n");
-            }
-            catch (Exception ex)
-            {
-                string message = $"Failed to update client status \"{status.ToNonNullString()}\" due to an exception: {ex.Message}";
-                HandleException(new InvalidOperationException(message, ex));
-            }
-        }
-
-        /// <summary>
-        /// Displays a broadcast message to all subscribed clients.
-        /// </summary>
-        /// <param name="status">Formatted status message to send to all clients.</param>
-        /// <param name="type"><see cref="UpdateType"/> of message to send.</param>
-        /// <param name="args">Arguments of the formatted status message.</param>
-        private void DisplayStatusMessage(string status, UpdateType type, params object[] args)
-        {
-            try
-            {
-                DisplayStatusMessage(string.Format(status, args), type);
-            }
-            catch (Exception ex)
-            {
-                string message = $"Failed to update client status \"{status.ToNonNullString()}\" due to an exception: {ex.Message}";
-                HandleException(new InvalidOperationException(message, ex));
-            }
-        }
-
-        #endregion
+        #endregion [ Broadcast Message Handling ]
 
         #region[ Common Methods ]
-
-        // Gets derived name of specified object.
-        private string GetDerivedName(object sender)
-        {
-            return m_derivedNameCache.GetOrAdd(sender, key =>
-            {
-                string name;
-
-                if (key is IProvideStatus statusProvider)
-                    name = statusProvider.Name;
-                else
-                    name = key as string;
-
-                if (string.IsNullOrWhiteSpace(name))
-                    name = key.GetType().Name;
-
-                return name;
-            });
-        }
-
-        // Send the error to the service helper and error logger
-        private void HandleException(Exception ex)
-        {
-            string newLines = string.Format("{0}{0}", Environment.NewLine);
-
-            m_serviceHelper.ErrorLogger.Log(ex);
-            m_serviceHelper.UpdateStatus(UpdateType.Alarm, ex.Message + newLines);
-        }
-
-        /// <summary>
-        /// Adds or updates a <see cref="ProxyConnection"/> in the running configuration,
-        /// materializes the corresponding <see cref="StreamProxy"/>, and persists the change to disk.
-        /// Mirrors the logic used by the TCP-based <c>UploadConnection</c> command handler.
-        /// </summary>
-        /// <param name="connection"><see cref="ProxyConnection"/> to add or update.</param>
-        /// <exception cref="InvalidOperationException">Configuration has not yet been loaded.</exception>
-        internal void AddConnection(ProxyConnection connection)
-        {
-            if (m_currentConfiguration is null)
-                throw new InvalidOperationException("Configuration is not yet loaded.");
-
-            lock (m_streamSplitters)
-            {
-                StreamProxy existing = m_streamSplitters.Find(s => s.ID == connection.ID);
-
-                if (existing is not null)
-                {
-                    existing.ProxyConnection = connection;
-                    m_currentConfiguration[connection.ID] = connection;
-                }
-                else
-                {
-                    StreamProxy splitter = new StreamProxy(connection);
-
-                    splitter.StatusMessage    += splitter_StatusMessage;
-                    splitter.ProcessException += splitter_ProcessException;
-
-                    m_streamSplitters.Add(splitter);
-                    m_serviceHelper.ServiceComponents.Add(splitter);
-                    m_currentConfiguration.Add(connection);
-                }
-            }
-
-            BackupConfiguration();
-
-            ProxyConnectionCollection.SaveConfiguration(
-                m_currentConfiguration,
-                FilePath.GetAbsolutePath(ConfigurationFileName));
-
-            // Notify connected Manager instances to refresh their configuration view.
-            DisplayStatusMessage(ApiConfigChangedBroadcast, UpdateType.Information);
-        }
-
-        /// <summary>
-        /// Removes the <see cref="ProxyConnection"/> identified by <paramref name="id"/> from the
-        /// running configuration, stops the associated <see cref="StreamProxy"/>, and persists the change.
-        /// </summary>
-        /// <param name="id">ID of the <see cref="ProxyConnection"/> to remove.</param>
-        /// <returns>
-        /// <c>true</c> if the connection was found and removed; <c>false</c> if it did not exist.
-        /// </returns>
-        /// <exception cref="InvalidOperationException">Configuration is not yet loaded.</exception>
-        internal bool RemoveConnection(Guid id)
-        {
-            if (m_currentConfiguration is null)
-                throw new InvalidOperationException("Configuration is not yet loaded.");
-
-            lock (m_streamSplitters)
-            {
-                ProxyConnection connection = m_currentConfiguration[id];
-
-                if (connection is null)
-                    return false;
-
-                StreamProxy splitter = m_streamSplitters.Find(s => s.ID == id);
-
-                if (splitter is not null)
-                {
-                    splitter.Stop();
-                    splitter.Dispose();
-                    m_streamSplitters.Remove(splitter);
-                    m_serviceHelper.ServiceComponents.Remove(splitter);
-                }
-
-                // RemovingItem fires but has no subscriber in ServiceHost — no UI dialog.
-                // In StreamSplitterManager the event shows a confirmation dialog, but that
-                // code runs in a different process and does not affect the service.
-                m_currentConfiguration.Remove(connection);
-            }
-
-            BackupConfiguration();
-
-            ProxyConnectionCollection.SaveConfiguration(
-                m_currentConfiguration,
-                FilePath.GetAbsolutePath(ConfigurationFileName));
-
-            // Notify connected Manager instances to refresh their configuration view.
-            DisplayStatusMessage(ApiConfigChangedBroadcast, UpdateType.Information);
-
-            return true;
-        }
-
-        #endregion
+        #endregion [ Methods ]
 
         #endregion
     }

@@ -19,8 +19,14 @@
 //  09/03/2013 - J. Ritchie Carroll
 //       Generated original version of source code.
 //  06/05/2026 - Marcos Vinicius Snak
-//       ApplyStreamProxyStatusUpdates: detect connections added externally (e.g. via REST API)
-//       and trigger automatic DownloadConfig so the Manager list stays in sync.
+//       m_serviceConnection_StatusMessage: detect connections added externally (e.g. via REST API)
+//       by matching the ApiConfigChangedMarker broadcast, and trigger automatic DownloadConfig so
+//       the Manager list stays in sync.
+//  08/22/2026 - Eduardo Oliveira
+//       Copilot Review follow-up (Story 7.4.8): corrected the 06/05/2026 entry above, which
+//       attributed the REST API auto-refresh detection to ApplyStreamProxyStatusUpdates. That
+//       method only applies StreamProxyStatus updates received from GetStreamProxyStatus and is
+//       unrelated to the [API_CONFIG_CHANGED] broadcast handled in m_serviceConnection_StatusMessage.
 //
 //******************************************************************************************************
 
