@@ -452,31 +452,7 @@ namespace StreamSplitter.Api.Controllers
 
             // Merge only the provided sub-fields into the existing connection string.
             // Omitted fields (null) retain their current values.
-            Dictionary<string, string> settings = existing.ConnectionString.ParseKeyValuePairs();
-
-            if (request.Name != null)
-                settings["name"] = request.Name;
-
-            if (request.Enabled.HasValue)
-                settings["enabled"] = request.Enabled.Value.ToString().ToLowerInvariant();
-
-            if (request.SourceSettings != null)
-            {
-                if (string.IsNullOrEmpty(request.SourceSettings))
-                    settings.Remove("sourceSettings");
-                else
-                    settings["sourceSettings"] = request.SourceSettings;
-            }
-
-            if (request.ProxySettings != null)
-            {
-                if (string.IsNullOrEmpty(request.ProxySettings))
-                    settings.Remove("proxySettings");
-                else
-                    settings["proxySettings"] = request.ProxySettings;
-            }
-
-            string updatedConnectionString = settings.JoinKeyValuePairs();
+            string updatedConnectionString = MergeConnectionString(existing.ConnectionString, request);
 
             ProxyConnection updated = new ProxyConnection
             {
@@ -627,6 +603,40 @@ namespace StreamSplitter.Api.Controllers
         internal static bool ExceedsMaxImportSize(long? contentLength, int maxSizeBytes)
         {
             return contentLength.HasValue && contentLength.Value > maxSizeBytes;
+        }
+
+        // Merges only the provided sub-fields of `request` into `existingConnectionString`. Omitted
+        // fields (null) retain their current value; sending an empty string for sourceSettings/
+        // proxySettings removes that sub-string entirely. Extracted from UpdateConnection as a pure
+        // function so the partial-update/no-overwrite semantics (Task 7.4.8.8) can be unit tested
+        // without a live ServiceHost.
+        internal static string MergeConnectionString(string existingConnectionString, UpdateConnectionRequest request)
+        {
+            Dictionary<string, string> settings = existingConnectionString.ParseKeyValuePairs();
+
+            if (request.Name != null)
+                settings["name"] = request.Name;
+
+            if (request.Enabled.HasValue)
+                settings["enabled"] = request.Enabled.Value.ToString().ToLowerInvariant();
+
+            if (request.SourceSettings != null)
+            {
+                if (string.IsNullOrEmpty(request.SourceSettings))
+                    settings.Remove("sourceSettings");
+                else
+                    settings["sourceSettings"] = request.SourceSettings;
+            }
+
+            if (request.ProxySettings != null)
+            {
+                if (string.IsNullOrEmpty(request.ProxySettings))
+                    settings.Remove("proxySettings");
+                else
+                    settings["proxySettings"] = request.ProxySettings;
+            }
+
+            return settings.JoinKeyValuePairs();
         }
 
         #endregion

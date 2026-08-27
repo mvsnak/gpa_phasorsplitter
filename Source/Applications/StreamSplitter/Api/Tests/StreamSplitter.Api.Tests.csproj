@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>StreamSplitter.Api.Tests</RootNamespace>
+    <AssemblyName>StreamSplitter.Api.Tests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Moq" Version="4.20.72" />
+    <PackageReference Include="Microsoft.AspNet.WebApi.Core" Version="5.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Framework reference needed to resolve ServiceHost's ServiceBase base type. -->
+    <Reference Include="System.ServiceProcess" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\StreamSplitter.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- GSF.Core provides the ParseKeyValuePairs/JoinKeyValuePairs extensions exercised by
+         MergeConnectionString. Referenced directly (same binary as StreamSplitter.csproj) because
+         the HintPath-based reference does not flow transitively from the non-SDK project reference. -->
+    <Reference Include="GSF.Core">
+      <HintPath>..\..\..\..\Dependencies\GSF\GSF.Core.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
