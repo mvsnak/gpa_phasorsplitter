@@ -28,6 +28,15 @@
 //       Wired AuthenticationSchemes/AnonymousResourceExpression into TryStartWebHosting with a
 //       fail-secure check (IsAuthenticationSchemeSupported) instead of leaving them unread. Added the
 //       configurable MaxImportFileSizeBytes setting used by the import endpoint.
+//  09/02/2026 - Eduardo Oliveira
+//       Copilot Review follow-up: AuthenticationSchemes now actually gates access
+//       instead of only being validated. TryStartWebHosting parses it into System.Net.
+//       AuthenticationSchemes (TryParseAuthenticationSchemes) and exposes it, along with the compiled
+//       AnonymousResourceExpression pattern, via WebApiAuthenticationSchemes/
+//       WebApiAnonymousResourcePattern. Api.Startup wires SelectAuthenticationScheme into the OWIN
+//       HttpListener's AuthenticationSchemeSelectorDelegate, so Basic/Ntlm/Negotiate/
+//       IntegratedWindowsAuthentication are enforced by the listener itself for any path outside the
+//       anonymous pattern. Default configuration (AuthenticationSchemes=Anonymous) is unaffected.
 //
 //******************************************************************************************************
 
@@ -51,6 +60,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Runtime;
 using System.ServiceProcess;
 using System.Text;
@@ -146,6 +156,24 @@ namespace StreamSplitter
             ConfigurationFile.Current.Settings["systemSettings"]["MaxImportFileSizeBytes"].ValueAs(DefaultMaxImportFileSizeBytes);
 
         /// <summary>
+        /// Gets the compiled pattern matching web API resource paths that remain accessible without
+        /// credentials regardless of <see cref="WebApiAuthenticationSchemes"/>, as configured by
+        /// the <c>AnonymousResourceExpression</c> setting. Defaults to the pattern for
+        /// <c>^/api/</c> before the web host starts, or if the configured expression fails to compile.
+        /// </summary>
+        internal static Regex WebApiAnonymousResourcePattern { get; private set; } =
+            new(DefaultAnonymousResourceExpression, RegexOptions.Compiled);
+
+        /// <summary>
+        /// Gets the <see cref="AuthenticationSchemes"/> currently enforced by the web API's
+        /// underlying <see cref="HttpListener"/> for resources outside <see
+        /// cref="WebApiAnonymousResourcePattern"/>, as parsed from the <c>AuthenticationSchemes</c>
+        /// setting by <see cref="TryStartWebHosting"/>. Defaults to <see
+        /// cref="AuthenticationSchemes.Anonymous"/> before the web host starts.
+        /// </summary>
+        internal static AuthenticationSchemes WebApiAuthenticationSchemes { get; private set; } = AuthenticationSchemes.Anonymous;
+
+        /// <summary>
         /// Gets the current proxy connection configuration. Returns <c>null</c> if the
         /// configuration has not yet been loaded.
         /// </summary>
@@ -168,14 +196,77 @@ namespace StreamSplitter
 
         /// <summary>
         /// Determines whether <paramref name="scheme"/> is an authentication scheme supported by
-        /// the web API host. Only <c>"Anonymous"</c> is currently implemented; any other value is
-        /// rejected so <see cref="TryStartWebHosting"/> fails secure instead of silently falling
-        /// back to anonymous access.
+        /// the web API host. Equivalent to calling <see cref="TryParseAuthenticationSchemes"/> and
+        /// discarding the parsed value.
         /// </summary>
         /// <param name="scheme">Configured value of the <c>AuthenticationSchemes</c> setting.</param>
         internal static bool IsAuthenticationSchemeSupported(string scheme)
         {
-            return string.Equals(scheme?.Trim(), DefaultAuthenticationScheme, StringComparison.OrdinalIgnoreCase);
+            return TryParseAuthenticationSchemes(scheme, out _);
+        }
+
+        /// <summary>
+        /// Resolves the <see cref="AuthenticationSchemes"/> that should be required for a given web
+        /// API request path. Used as the <see
+        /// cref="HttpListener.AuthenticationSchemeSelectorDelegate"/> by <see cref="Api.Startup"/>
+        /// so <see cref="WebApiAnonymousResourcePattern"/> can carve out specific resources (e.g.
+        /// Swagger UI, or all of <c>/api/</c> by default) regardless of <see cref="WebApiAuthenticationSchemes"/>.
+        /// </summary>
+        /// <param name="absolutePath">Absolute path of the incoming request, e.g. <c>/api/connections</c>.</param>
+        /// <param name="anonymousResourcePattern">
+        /// Pattern matching paths that stay anonymous; see <see cref="WebApiAnonymousResourcePattern"/>.
+        /// </param>
+        /// <param name="configuredSchemes">
+        /// Schemes required for paths that do not match <paramref name="anonymousResourcePattern"/>.
+        /// </param>
+        internal static AuthenticationSchemes SelectAuthenticationScheme(string absolutePath, Regex anonymousResourcePattern, AuthenticationSchemes configuredSchemes)
+        {
+            if (anonymousResourcePattern is not null && anonymousResourcePattern.IsMatch(absolutePath ?? string.Empty))
+                return AuthenticationSchemes.Anonymous;
+
+            return configuredSchemes;
+        }
+
+        /// <summary>
+        /// Parses the <c>AuthenticationSchemes</c> setting into the <see
+        /// cref="AuthenticationSchemes"/> flags enforced by the underlying <see
+        /// cref="HttpListener"/>. Accepts <c>"Anonymous"</c> or any comma-separated combination of
+        /// <c>"Basic"</c>, <c>"Ntlm"</c>, <c>"Negotiate"</c>, and
+        /// <c>"IntegratedWindowsAuthentication"</c>. <c>"Digest"</c> and <c>"None"</c> are rejected
+        /// - <c>Digest</c> would require a realm/credential store this host does not provide, and
+        ///   <c>None</c> would deny every request rather than requiring credentials for them.
+        /// </summary>
+        /// <param name="configuredValue">
+        /// Configured value of the <c>AuthenticationSchemes</c> setting.
+        /// </param>
+        /// <param name="schemes">
+        /// The parsed schemes on success, or <see cref="AuthenticationSchemes.Anonymous"/> when
+        /// parsing fails.
+        /// </param>
+        /// <returns>
+        /// <see langword="true"/> if <paramref name="configuredValue"/> is supported; otherwise,
+        /// <see langword="false"/>.
+        /// </returns>
+        internal static bool TryParseAuthenticationSchemes(string configuredValue, out AuthenticationSchemes schemes)
+        {
+            schemes = AuthenticationSchemes.Anonymous;
+
+            if (string.IsNullOrWhiteSpace(configuredValue))
+                return false;
+
+            if (!Enum.TryParse(configuredValue, true, out schemes))
+            {
+                schemes = AuthenticationSchemes.Anonymous;
+                return false;
+            }
+
+            if (schemes == AuthenticationSchemes.None || schemes.HasFlag(AuthenticationSchemes.Digest))
+            {
+                schemes = AuthenticationSchemes.Anonymous;
+                return false;
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -1301,44 +1392,53 @@ namespace StreamSplitter
                 // anonymously when an unsupported authentication scheme is configured.
                 string authenticationScheme = systemSettings["AuthenticationSchemes"].ValueAs(DefaultAuthenticationScheme);
 
-                if (!IsAuthenticationSchemeSupported(authenticationScheme))
+                if (!TryParseAuthenticationSchemes(authenticationScheme, out AuthenticationSchemes parsedSchemes))
                 {
                     DisplayStatusMessage(
-                        "Web API hosting was not started: authentication scheme \"{0}\" is not supported. Only \"{1}\" is currently implemented - refusing to expose the API rather than falling back to anonymous access.",
+                        "Web API hosting was not started: authentication scheme \"{0}\" is not supported. Supported values are \"Anonymous\", or any comma-separated combination of \"Basic\", \"Ntlm\", \"Negotiate\", and \"IntegratedWindowsAuthentication\" - refusing to expose the API rather than falling back to anonymous access.",
                         UpdateType.Alarm,
-                        authenticationScheme.ToNonNullString("<empty>"),
-                        DefaultAuthenticationScheme);
+                        authenticationScheme.ToNonNullString("<empty>"));
 
                     return;
                 }
 
-                // AnonymousResourceExpression has no consumer yet since Anonymous is the only
-                // implemented scheme, but its shape is still validated so a malformed value is
-                // caught at startup rather than the first time a future scheme relies on it.
+                // Resources matching this pattern stay anonymous even when parsedSchemes requires
+                // credentials elsewhere - enforced per-request by SelectAuthenticationScheme, wired
+                // into the underlying HttpListener from Api.Startup.Configuration.
                 string anonymousResourceExpression = systemSettings["AnonymousResourceExpression"].ValueAs(DefaultAnonymousResourceExpression);
+                Regex anonymousResourcePattern;
 
                 try
                 {
-                    _ = new Regex(anonymousResourceExpression);
+                    anonymousResourcePattern = new Regex(anonymousResourceExpression, RegexOptions.Compiled);
                 }
                 catch (ArgumentException ex)
                 {
                     DisplayStatusMessage(
-                        "Configured AnonymousResourceExpression \"{0}\" is not a valid regular expression: {1}. This setting has no effect while the Anonymous authentication scheme is active.",
+                        "Configured AnonymousResourceExpression \"{0}\" is not a valid regular expression: {1}. Falling back to the default expression \"{2}\".",
                         UpdateType.Warning,
                         anonymousResourceExpression.ToNonNullString("<empty>"),
-                        ex.Message);
+                        ex.Message,
+                        DefaultAnonymousResourceExpression);
+
+                    anonymousResourcePattern = new Regex(DefaultAnonymousResourceExpression, RegexOptions.Compiled);
                 }
+
+                WebApiAuthenticationSchemes = parsedSchemes;
+                WebApiAnonymousResourcePattern = anonymousResourcePattern;
 
                 string webHostURL = systemSettings["WebHostURL"].ValueAs(DefaultWebHostURL);
 
                 m_webAppHost = WebApp.Start<Startup>(webHostURL);
 
                 DisplayStatusMessage(
-                    "Web API hosting started at \"{0}\" using the \"{1}\" authentication scheme. Swagger UI: {0}/swagger",
+                    parsedSchemes == AuthenticationSchemes.Anonymous
+                        ? "Web API hosting started at \"{0}\" using the \"{1}\" authentication scheme. Swagger UI: {0}/swagger"
+                        : "Web API hosting started at \"{0}\" using the \"{1}\" authentication scheme (anonymous for paths matching \"{2}\"). Swagger UI: {0}/swagger",
                     UpdateType.Information,
                     webHostURL,
-                    authenticationScheme);
+                    parsedSchemes,
+                    anonymousResourceExpression);
             }
             catch (Exception ex)
             {

@@ -180,6 +180,7 @@
     <Compile Include="Api\Models\CreateConnectionRequest.cs" />
     <Compile Include="Api\Models\ConnectionStatusDto.cs" />
     <Compile Include="Api\Models\UpdateConnectionRequest.cs" />
+    <Compile Include="Api\BoundedMultipartMemoryStreamProvider.cs" />
     <Compile Include="Api\Controllers\ConnectionsController.cs" />
     <Compile Include="Api\Filters\FileUploadOperationFilter.cs" />
     <Compile Include="Api\Startup.cs" />
